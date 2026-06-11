@@ -1,0 +1,317 @@
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Config {
+    pub project: ProjectConfig,
+    pub index: IndexConfig,
+    pub embedding: EmbeddingConfig,
+    pub vector_store: VectorStoreConfig,
+    pub bm25: Bm25Config,
+    pub reranker: Option<RerankerConfig>,
+    pub watcher: WatcherConfig,
+    pub chunking: ChunkingConfig,
+    /// Optional search-tuning block. All fields default to the values
+    /// hard-coded in `src/search.rs` (quality-first: K_DENSE=K_SPARSE=
+    /// RERANK_TOP_N=30, RRF_K=60). Override per-project for
+    /// hardware-specific tuning without a recompile.
+    #[serde(default)]
+    pub search: SearchConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SearchConfig {
+    /// Top-K candidates pulled from the dense (Qdrant) side. Bigger =
+    /// better recall at linear reranker token cost.
+    pub dense_k: Option<usize>,
+    /// Top-K candidates pulled from the sparse (BM25/tantivy) side.
+    pub sparse_k: Option<usize>,
+    /// Only the top-N candidates by RRF score are reranked by the
+    /// cross-encoder; the tail keeps RRF score. Cap on reranker work.
+    pub rerank_top_n: Option<usize>,
+    /// Reciprocal Rank Fusion constant. Smaller favors top-of-list
+    /// matches more aggressively; 60 is the Cormack et al. default.
+    pub rrf_k: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProjectConfig {
+    pub id: String,
+    pub root: PathBuf,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct IndexConfig {
+    pub languages: Vec<String>,
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct EmbeddingConfig {
+    /// Kept for TOML clarity (`"openai-compatible"` etc.) and as a
+    /// forward-compatible discriminator if/when we support multiple
+    /// backends. The code currently hardcodes the openai-compatible
+    /// HTTP shape.
+    #[allow(dead_code)]
+    pub provider: String,
+    pub url: String,
+    pub model: String,
+    pub dimensions: usize,
+    /// DEPRECATED: ignored. Batch size is now determined dynamically by the
+    /// AIMD adaptive batcher. Kept Option<...> so existing configs keep parsing;
+    /// presence triggers an advisory log at startup.
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+    /// Outer HTTP timeout. The adaptive batcher sets a much shorter per-request
+    /// timeout via `tokio::time::timeout` proportional to batch size; this
+    /// value just bounds the reqwest client's hard cap.
+    #[serde(default = "default_embedding_timeout")]
+    pub timeout_secs: u64,
+    /// Advisory: starting hint for the adaptive batcher's `budget_chars`.
+    /// AIMD will halve it down if it's too optimistic, or grow it up to
+    /// ~256 KB if conservative. If unset, defaults to 10_000.
+    #[serde(default)]
+    pub max_input_chars: Option<usize>,
+    /// On `index` start, wait up to N seconds for the embedding server to become ready
+    /// (it returns 503 "Loading model" while warming up — typically 1-3 min for jina-code).
+    /// Set to 0 to disable the wait.
+    #[serde(default = "default_startup_wait_secs")]
+    pub startup_wait_secs: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct VectorStoreConfig {
+    pub provider: String,
+    pub url: String,
+    /// Collection name. **Recommended: leave unset** so it auto-derives
+    /// from `{project.id}_{8-hex-sha256(project.id + canonical_root)}` —
+    /// guarantees no accidental collisions between different users or
+    /// different checkouts of the same project name. Explicit overrides
+    /// are still supported (for migrations, intentional sharing) but
+    /// trigger a marker-point verification at startup that hard-fails on
+    /// fingerprint mismatch.
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default = "default_qdrant_timeout")]
+    pub timeout_secs: u64,
+}
+
+impl VectorStoreConfig {
+    /// Resolve the actual collection name: use the explicit override if
+    /// present, otherwise auto-derive from project id + canonical root.
+    /// The derivation is stable: same project at same path always yields
+    /// the same name; same project at a different path yields a different
+    /// name (which is the point — no accidental collisions).
+    pub fn resolve_collection_name(&self, project: &ProjectConfig) -> String {
+        if let Some(explicit) = self.collection.as_ref() {
+            if !explicit.trim().is_empty() {
+                return explicit.clone();
+            }
+        }
+        derive_collection_name(project)
+    }
+}
+
+fn derive_collection_name(project: &ProjectConfig) -> String {
+    use sha2::{Digest, Sha256};
+    // canonicalize in Config::load already ran, so project.root is absolute.
+    let root_str = project.root.to_string_lossy();
+    let mut hasher = Sha256::new();
+    hasher.update(project.id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(root_str.as_bytes());
+    let digest = hasher.finalize();
+    let suffix = hex::encode(&digest[..4]); // 8 hex chars
+    let slug = slugify_for_qdrant(&project.id);
+    format!("{}_{}", slug, suffix)
+}
+
+/// Qdrant collection names: ASCII letters / digits / `-` / `_`. Replace
+/// anything else with `_`, collapse runs.
+fn slugify_for_qdrant(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_underscore = false;
+    for c in s.chars() {
+        let safe = c.is_ascii_alphanumeric() || c == '-' || c == '_';
+        if safe {
+            out.push(c);
+            last_underscore = false;
+        } else if !last_underscore {
+            out.push('_');
+            last_underscore = true;
+        }
+    }
+    out
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Bm25Config {
+    #[allow(dead_code)]
+    pub provider: String,
+    pub index_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RerankerConfig {
+    #[allow(dead_code)]
+    pub provider: String,
+    pub url: String,
+    pub model: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_reranker_timeout")]
+    pub timeout_secs: u64,
+    /// Truncate each candidate document to this many bytes before sending
+    /// to the reranker. Sized for jina-reranker-v2 at its default ctx=1024:
+    /// query (~30 tok) + doc (~830 tok ≈ 2500 chars at 3:1) fits.
+    /// If your reranker server has `-c 8192` or bigger, bump this to ~8000
+    /// for better quality (more chunk context → better ranking).
+    #[serde(default = "default_reranker_max_doc_chars")]
+    pub max_document_chars: usize,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct WatcherConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ChunkingConfig {
+    /// Default strategy for languages without an entry in `per_language`.
+    /// "lines" — line-window chunker; "headings" — markdown H1/H2-aware
+    /// chunker.
+    pub strategy: String,
+    #[serde(default = "default_max_chunk_lines")]
+    pub max_chunk_lines: usize,
+    #[serde(default = "default_overlap_lines")]
+    pub overlap_lines: usize,
+    /// Byte-size cap per chunk. The chunker stops accumulating lines whenever
+    /// either `max_chunk_lines` OR `max_chunk_chars` is hit, whichever comes
+    /// first. Keep this comfortably below `embedding.max_input_chars` so a
+    /// produced chunk doesn't get rejected downstream.
+    #[serde(default = "default_max_chunk_chars")]
+    pub max_chunk_chars: usize,
+    /// Per-language overrides. Keyed by walker's language string (`"rust"`,
+    /// `"markdown"`, `"toml"`, etc — see `walker::language_from_ext`).
+    /// Any field not specified here falls back to the top-level default.
+    /// Typical use: `[chunking.per_language.markdown] strategy = "headings"`
+    /// so docs cut on section boundaries instead of line windows.
+    #[serde(default)]
+    pub per_language: HashMap<String, LanguageChunkConfig>,
+}
+
+/// Per-language override block. Every field is optional; whatever's set
+/// replaces the top-level `[chunking]` default for files in that language.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct LanguageChunkConfig {
+    pub strategy: Option<String>,
+    pub max_chunk_lines: Option<usize>,
+    pub overlap_lines: Option<usize>,
+    pub max_chunk_chars: Option<usize>,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_debounce_ms() -> u64 {
+    500
+}
+fn default_max_chunk_lines() -> usize {
+    80
+}
+fn default_overlap_lines() -> usize {
+    15
+}
+fn default_max_chunk_chars() -> usize {
+    // Upper bound on a single chunk's byte size. Chunks above this would
+    // dominate any batch; the chunker breaks on either max_chunk_lines or
+    // max_chunk_chars (whichever hits first). Sub-splits on sentence
+    // boundaries for very long lines (markdown, generated content).
+    20_000
+}
+fn default_embedding_timeout() -> u64 {
+    300
+}
+fn default_startup_wait_secs() -> u64 {
+    300
+}
+fn default_qdrant_timeout() -> u64 {
+    60
+}
+fn default_reranker_timeout() -> u64 {
+    120
+}
+fn default_reranker_max_doc_chars() -> usize {
+    // Quality-first: 8000 chars ≈ 2700 tokens leaves the cross-encoder
+    // looking at full function bodies (most Rust functions ≤ 250 lines
+    // ≈ 7000 chars), not just signatures. Fits bge-reranker-v2-m3 at
+    // its native ctx=8192 with safe headroom for query + special tokens.
+    // Drop to 4000 if your search latency is unacceptably long; drop to
+    // 2000 if your reranker is stuck at legacy ctx=1024.
+    8_000
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading config: {}", path.display()))?;
+        let mut cfg: Config =
+            toml::from_str(&raw).with_context(|| format!("parsing config: {}", path.display()))?;
+
+        cfg.project.root = expand_path(&cfg.project.root)?;
+        cfg.bm25.index_path = expand_path(&cfg.bm25.index_path)?;
+
+        if !cfg.project.root.exists() {
+            anyhow::bail!(
+                "project.root does not exist: {}",
+                cfg.project.root.display()
+            );
+        }
+
+        // Canonicalize project.root to an absolute, symlink-resolved path.
+        // The walker is permissive about relative roots, but notify (used by
+        // `watch`) reports absolute paths in events — so any relative root
+        // creates a strip_prefix mismatch between the two code paths and
+        // chunks end up stored under inconsistent `file=` keys. Canonicalize
+        // once here and both code paths agree.
+        cfg.project.root = std::fs::canonicalize(&cfg.project.root).with_context(|| {
+            format!(
+                "canonicalizing project.root: {}",
+                cfg.project.root.display()
+            )
+        })?;
+
+        // Advisory: knobs that were static in earlier versions are now derived
+        // by the AIMD adaptive batcher at runtime. Don't error — just inform.
+        if let Some(b) = cfg.embedding.batch_size {
+            tracing::info!(
+                value = b,
+                "embedding.batch_size is now ignored — batch sizes are derived by the adaptive batcher"
+            );
+        }
+        if let Some(m) = cfg.embedding.max_input_chars {
+            tracing::info!(
+                value = m,
+                "embedding.max_input_chars is now advisory (used as the adaptive batcher's initial budget hint)"
+            );
+        }
+
+        Ok(cfg)
+    }
+}
+
+fn expand_path(p: &Path) -> Result<PathBuf> {
+    let s = p.to_str().context("non-utf8 path in config")?;
+    let expanded = shellexpand::full(s)
+        .with_context(|| format!("expanding path: {}", s))?
+        .into_owned();
+    Ok(PathBuf::from(expanded))
+}

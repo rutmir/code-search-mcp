@@ -1,0 +1,245 @@
+# Fully-annotated reference config for a code-search-mcp project.
+# Copy to <project>/.claude/code-search.toml and adjust paths / IPs / language list.
+
+[project]
+# Short, stable identifier for this project. Used in log lines, the
+# auto-derived Qdrant collection name, and the per-project tantivy state dir.
+id = "myproject"
+# Either absolute path or "." if MCP server is launched from the project root
+# (which is the normal case when Claude Code spawns it via .mcp.json at the project root).
+root = "."
+
+[index]
+# Add any of the following to enable that language's files:
+#   tree-sitter (AST-aware):  "rust" "python" "cpp" "dart" "typescript"
+#                             "javascript" "go" "csharp" "java"
+#   structured-text:          "markdown" "toml" "yaml" "json"
+#   plain-text bucket:        "shell" "systemd" "env" "text"
+# `text` is a catch-all for *.txt / *.local / *.example / *.ini / *.cfg /
+# *.conf — useful for sample-config files, INI/CFG configs, and notes.
+languages = ["rust", "toml", "markdown"]
+respect_gitignore = true
+exclude = ["target/**", "build/**", "**/*.lock"]
+
+[embedding]
+# OpenAI-compatible /v1/embeddings endpoint (llama.cpp server / vLLM / Ollama).
+provider = "openai-compatible"
+url = "http://<ip>:<port>/v1/embeddings"
+model = "jina-code-embeddings-0.5b"
+# jina-code-embeddings-0.5b is built on Qwen3-0.6B (hidden_size=896), NOT 768.
+# `check` verifies this at startup against the live endpoint.
+dimensions = 896
+# Outer HTTP timeout for the embedding client. The adaptive batcher sets a
+# per-request timeout proportional to batch size (5s..180s), which is almost
+# always shorter than this cap. Default if omitted: 300.
+# timeout_secs = 300
+# Optional warm-start hint for the AIMD adaptive batcher's initial budget
+# (in chars). If unset, defaults to 10_000. The batcher self-tunes from
+# there: halves on failure, +25% after 5 successes in a row, bounded to
+# [1 KB, 256 KB]. Set this only if you know your server's sweet spot and
+# want to skip the cold-start ramp:
+#   ubatch=2048 → ~6_000
+#   ubatch=8192 → ~24_000
+#   ubatch=16384 → ~48_000
+# max_input_chars = 6000
+# On `index` start, wait up to N seconds for embedding server to be ready
+# (returns 503 "Loading model" while warming up — typically 1-3 min for jina-code).
+# Set to 0 to disable (start immediately, files may fail until model finishes
+# loading). Default if omitted: 300.
+startup_wait_secs = 300
+
+[vector_store]
+provider = "qdrant"
+url = "http://<ip>:<port>"
+# RECOMMENDED: leave `collection` unset. The indexer auto-derives a stable,
+# collision-resistant collection name as
+#     {slug(project.id)}_{8-hex-sha256(project.id + canonical_root)}
+# so two users on different paths (or different projects that happen to
+# pick the same `id`) get distinct collection names automatically.
+#
+# Set `collection` only for explicit migration / intentional sharing.
+# In either case, a project-identity marker point is written to the
+# collection at first `index` — subsequent runs (index/watch/search/check)
+# verify the marker's fingerprint and hard-fail on mismatch, preventing
+# silent data co-mingling.
+# collection = "myproject_code"
+# HTTP timeout for Qdrant operations. Default: 60. The client now retries
+# transient failures (keep-alive races, 5xx) with exponential backoff, so
+# this only bounds individual attempts.
+# timeout_secs = 60
+
+[bm25]
+provider = "tantivy"
+index_path = "~/.local/state/code-search-mcp/myproject/tantivy"
+
+[reranker]
+# llama.cpp server with --reranking flag exposes /v1/rerank endpoint.
+# Recommended: BAAI/bge-reranker-v2-m3 (8192 native ctx, high quality on
+# code retrieval, runs efficiently in llama.cpp).
+# Avoid: jina-reranker-v3 — broken classifier head load in mainline llama.cpp
+# (see https://github.com/ggml-org/llama.cpp/issues/17189; tested as of
+# 2026-06; verify with a discriminative rerank smoke test before using).
+provider = "openai-compatible"
+url = "http://<ip>:<port>/v1/rerank"
+model = "bge-reranker-v2-m3"
+enabled = true
+# Per-request timeout is throughput-aware: the client tracks an EWMA of
+# observed chars/sec across successful rerank calls and derives each call's
+# timeout from that. `timeout_secs` is just the outer reqwest hard cap;
+# the dynamic timeout (proportional to batch size at observed throughput)
+# almost always fires first. Default 120 is plenty on top of the dynamic.
+# timeout_secs = 120
+# Truncate each candidate document to this many BYTES before sending.
+# Defaults to 8000 — sized so the cross-encoder sees full function bodies
+# (most Rust functions ≤ 250 lines ≈ 7000 chars) within bge-reranker-v2-m3's
+# native ctx=8192 plus headroom for query + special tokens.
+# This is the QUALITY-first setting. Drop to ~4000 if you need ~2× faster
+# rerank latency at some loss of rank quality on long functions. Drop to
+# ~2000 if your reranker is stuck at legacy ctx=1024 (the system falls
+# back to RRF-only ranking automatically on context-overflow errors).
+# max_document_chars = 8000
+
+[watcher]
+# When `enabled = true` (the default), `serve` spawns a background watcher
+# task that does an initial sync (cheap thanks to the sha256 cache) and
+# then tails filesystem events. So a single `serve` process both answers
+# MCP search calls AND keeps the index fresh as the user edits — no need
+# to also run `watch` standalone.
+#
+# Set false to disable when running `serve` against a static / curated
+# index that you reindex manually.
+enabled = true
+# Quiet window (ms) before processing a batch of events. Collapses
+# formatter / save-storm bursts into one reindex per file. 500 ms covers
+# typical IDE save behavior (write temp → rename → fsync).
+debounce_ms = 500
+
+# Optional search-tuning block. All fields default to the quality-first
+# values hard-coded in src/search.rs. Override per-project for hardware-
+# specific tuning without a recompile.
+# [search]
+# dense_k = 30        # candidates from Qdrant (dense). Bigger = better recall.
+# sparse_k = 30       # candidates from tantivy BM25.
+# rerank_top_n = 30   # top-N by RRF go to cross-encoder; tail keeps RRF score.
+# rrf_k = 60          # Reciprocal Rank Fusion constant; smaller favors top of list.
+
+[chunking]
+# Available strategies:
+#   "lines"    — byte-aware line windows (current default; works for code)
+#   "headings" — markdown H1/H2-aware (cuts on section boundaries; fenced
+#                code-block aware so `# python comment` inside ``` ... ```
+#                isn't mistaken for a heading)
+#
+# Per-language overrides below pick different strategies / parameters for
+# specific file languages (walker's language string: "rust", "markdown",
+# "toml", "yaml", "json", "dart", "text").
+#
+# IMPORTANT: chunking parameters determine chunk *identity*
+# (chunk_uuid = hash of file + line range + chunk text). Changing strategy,
+# max_chunk_lines, overlap_lines, or max_chunk_chars REQUIRES `clear` +
+# reindex, otherwise old chunks become orphans in Qdrant.
+strategy = "lines"
+max_chunk_lines = 60
+overlap_lines = 10
+# Byte cap per chunk for the line-window strategy. Cuts on whichever limit
+# hits first (lines vs chars). For code with normal line lengths,
+# max_chunk_lines is the active constraint. For markdown / minified /
+# generated content with very long lines, this prevents emitting one giant
+# chunk. Lines longer than this are sub-split on sentence boundaries.
+max_chunk_chars = 20000
+
+# Markdown override: use heading-aware chunker so each section becomes one
+# chunk (heading + content until next H1/H2). Far better than line windows
+# for docs because:
+#   - One chunk = one semantic unit (a section is what people quote)
+#   - Cross-encoder sees the heading as anchor → better rerank quality
+#   - File:start-end ranges in results point at section boundaries
+# `max_chunk_chars` caps gigantic sections (e.g. 30 KB CHANGELOG version
+# blocks) — exceeding sections fall back to greedy line-pack with
+# sentence sub-split for paragraph-as-one-line cases.
+[chunking.per_language.markdown]
+strategy = "headings"
+max_chunk_chars = 15000
+
+# Rust override: AST-aware chunking via tree-sitter. Each top-level item
+# (fn / struct / enum / trait / impl / mod / const / type / use / macro)
+# becomes one chunk; methods inside impl blocks become separate chunks
+# qualified as `TypeName::method_name`. Result payload carries `kind`
+# and `name` so MCP results show
+#   `crates/foo/src/bar.rs:120-180  [rust]  fn process_one_file  score=...`
+# — the LLM gets the symbol anchor up front, can navigate by name. Falls
+# back to line-window chunking on parse failure (broken syntax, etc).
+[chunking.per_language.rust]
+strategy = "tree-sitter"
+max_chunk_chars = 8000
+
+# Python override: AST-aware chunking. Top-level def / class become one
+# chunk each, with `@decorator` lines preserved in the chunk text. Methods
+# inside a class emit as separate chunks qualified `ClassName.method_name`,
+# AND the class is emitted as a whole — both useful for retrieval. Files
+# that contain no def/class (e.g. an __init__.py with only imports, or a
+# script with top-level code only) fall back to line-window chunking so
+# they aren't dropped from the index.
+# Uncomment + add "python" to index.languages above to enable.
+# [chunking.per_language.python]
+# strategy = "tree-sitter"
+# max_chunk_chars = 8000
+
+# C++ override: AST-aware chunking. Top-level functions (`fn`), classes,
+# structs, unions, enums, namespaces. Outline method definitions like
+# `void Foo::bar() { ... }` keep their qualified `Foo::bar` name. Inline
+# methods inside a class body emit separately as `method` with
+# `Class::method_name`. `template<...>` wrappers are stripped — the
+# template parameters appear in the chunk text but kind/name come from
+# the wrapped function/class.
+# Uncomment + add "cpp" to index.languages above to enable.
+# [chunking.per_language.cpp]
+# strategy = "tree-sitter"
+# max_chunk_chars = 8000
+
+# Dart override: AST-aware chunking. Class / mixin / enum / extension at
+# top level; class methods become separate chunks qualified
+# `ClassName.method_name`. We use tree-sitter-dart 0.0.4 — class
+# structure is reliable; top-level standalone functions occasionally
+# fall through to line-window because that grammar is older.
+# Uncomment if your project has Dart code (already a recognized language
+# in walker).
+# [chunking.per_language.dart]
+# strategy = "tree-sitter"
+# max_chunk_chars = 8000
+
+# TypeScript override (extensions ts/tsx/mts/cts). Top-level fn / class /
+# method (qualified Class.method_name) / interface / type alias / enum.
+# `export` keyword preserved in chunk text. Uses TSX grammar internally
+# (a strict superset of plain TS).
+# Uncomment + add "typescript" to index.languages above to enable.
+# [chunking.per_language.typescript]
+# strategy = "tree-sitter"
+# max_chunk_chars = 8000
+
+# JavaScript override (js/jsx/mjs/cjs). Subset of the TS emitter — no
+# interfaces / type aliases / enums.
+# [chunking.per_language.javascript]
+# strategy = "tree-sitter"
+# max_chunk_chars = 8000
+
+# Go override. fn / method (qualified Receiver.method_name with both
+# pointer and value receivers normalized to base type name) / struct /
+# interface / type aliases. `type ( ... )` blocks emit one chunk per
+# declared name.
+# [chunking.per_language.go]
+# strategy = "tree-sitter"
+# max_chunk_chars = 8000
+
+# C# override (extensions cs). class / interface / struct / enum / record
+# (with method ClassName.method_name for methods, ctors, dtors, local fns)
+# / delegate. Namespaces descend (not emitted standalone).
+# [chunking.per_language.csharp]
+# strategy = "tree-sitter"
+# max_chunk_chars = 8000
+
+# Java override (extensions java). class / interface / enum / record /
+# annotation with method ClassName.method_name for methods + constructors.
+# [chunking.per_language.java]
+# strategy = "tree-sitter"
+# max_chunk_chars = 8000

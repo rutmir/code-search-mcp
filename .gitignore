@@ -1,0 +1,25 @@
+# Rust build artifacts. Cargo.lock IS committed (this is a binary).
+/target
+**/*.rs.bk
+
+# Coverage / profiling output
+*.profraw
+*.profdata
+
+# Editor / IDE
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Local dev scratch — never commit a real config with creds
+.env
+*.env.local
+dev/
+.dev/
