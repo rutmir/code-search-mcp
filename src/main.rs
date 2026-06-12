@@ -385,6 +385,35 @@ async fn run_check(config: &Config) -> Result<()> {
                     "reranker endpoint OK"
                 );
             }
+
+            // Chunking vs reranker-truncation sanity: a chunk bigger than
+            // max_document_chars gets cut before the cross-encoder sees it,
+            // so the reranker judges a fragment while the LLM later reads
+            // the full chunk. Legal, but worth knowing about.
+            let limit = reranker_cfg.max_document_chars;
+            let mut oversized: Vec<(String, usize)> = Vec::new();
+            if config.chunking.max_chunk_chars > limit {
+                oversized.push(("default".to_string(), config.chunking.max_chunk_chars));
+            }
+            for (lang, lc) in &config.chunking.per_language {
+                let chars = lc
+                    .max_chunk_chars
+                    .unwrap_or(config.chunking.max_chunk_chars);
+                if chars > limit {
+                    oversized.push((lang.clone(), chars));
+                }
+            }
+            for (lang, chars) in oversized {
+                warn!(
+                    lang = %lang,
+                    max_chunk_chars = chars,
+                    max_document_chars = limit,
+                    "chunks can exceed the reranker's truncation limit — the \
+                     cross-encoder will rank such chunks by their first \
+                     max_document_chars chars only. Consider lowering \
+                     chunking.max_chunk_chars or raising reranker.max_document_chars"
+                );
+            }
         }
     }
 

@@ -3,9 +3,22 @@ use std::path::Path;
 use tantivy::{
     collector::TopDocs,
     query::{QueryParser, TermQuery},
-    schema::{Field, IndexRecordOption, Schema, Value, INDEXED, STORED, STRING, TEXT},
+    schema::{
+        Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, INDEXED, STORED,
+        STRING,
+    },
+    tokenizer::{Token, TokenStream, Tokenizer},
     Index, IndexWriter, TantivyDocument, Term,
 };
+
+/// Bump this whenever the tantivy schema or the content tokenizer changes
+/// in a way that makes existing indexes stale. It feeds the marker's
+/// `config_hard` fingerprint, so the change triggers the auto-clear +
+/// full-rebuild flow instead of silently searching a half-compatible index.
+/// v2: code-aware content tokenizer (snake_case / camelCase splitting).
+pub const SCHEMA_VERSION: u32 = 2;
+
+const CODE_TOKENIZER_NAME: &str = "code";
 
 /// Tantivy BM25 index — sparse retrieval layer for hybrid search.
 ///
@@ -15,7 +28,8 @@ use tantivy::{
 ///   start_line — u64  + STORED + INDEXED
 ///   end_line   — u64  + STORED + INDEXED
 ///   lang       — STRING + STORED
-///   content    — TEXT + STORED (tokenized; primary BM25 search target)
+///   content    — STORED + indexed with the code-aware tokenizer (primary
+///                BM25 search target; see [`CodeTokenizer`])
 pub struct Bm25Index {
     pub writer: IndexWriter,
     pub fields: SchemaFields,
@@ -43,6 +57,7 @@ impl Bm25Index {
             Err(_) => Index::create_in_dir(path, schema.clone())
                 .with_context(|| format!("creating tantivy index in {}", path.display()))?,
         };
+        register_code_tokenizer(&index);
 
         let writer: IndexWriter = index
             .writer(50_000_000) // 50 MB heap
@@ -142,7 +157,12 @@ fn build_schema() -> (Schema, SchemaFields) {
     let start_line = b.add_u64_field("start_line", STORED | INDEXED);
     let end_line = b.add_u64_field("end_line", STORED | INDEXED);
     let lang = b.add_text_field("lang", STRING | STORED);
-    let content = b.add_text_field("content", TEXT | STORED);
+    let content_opts = TextOptions::default().set_stored().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(CODE_TOKENIZER_NAME)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    );
+    let content = b.add_text_field("content", content_opts);
     let schema = b.build();
     (
         schema,
@@ -155,6 +175,138 @@ fn build_schema() -> (Schema, SchemaFields) {
             content,
         },
     )
+}
+
+/// The tokenizer manager lives on the `Index` handle, not on disk — every
+/// place that opens the index (writer or read-only searcher) must register
+/// the code tokenizer or tantivy fails with "tokenizer not found".
+fn register_code_tokenizer(index: &Index) {
+    index
+        .tokenizers()
+        .register(CODE_TOKENIZER_NAME, CodeTokenizer);
+}
+
+/// Code-aware tokenizer: like tantivy's simple tokenizer (split on
+/// non-alphanumeric, lowercase), but identifiers are additionally split on
+/// `_` and camelCase humps — `build_si_portfolio` and `buildSiPortfolio`
+/// both index as [`build`, `si`, `portfolio`], so a query naming either
+/// form (or just `portfolio`) matches. Acronym runs keep their boundary
+/// (`HTTPServer` → [`http`, `server`]); digits stay attached to the
+/// preceding letters (`bm25` stays whole).
+///
+/// Only the split parts are emitted (no compound token): tantivy's
+/// QueryParser turns a multi-token word into a phrase query, so the exact
+/// identifier `build_si_portfolio` in a query still matches precisely —
+/// as the consecutive phrase [`build`, `si`, `portfolio`] — while an
+/// extra compound token would break that phrase's position sequence for
+/// cross-style (camel ↔ snake) lookups.
+#[derive(Clone)]
+struct CodeTokenizer;
+
+impl Tokenizer for CodeTokenizer {
+    type TokenStream<'a> = VecTokenStream;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> VecTokenStream {
+        /// Parts longer than this are hash-/base64-like noise, not words.
+        const MAX_TOKEN_BYTES: usize = 40;
+        let mut tokens = Vec::new();
+        let mut position = 0usize;
+
+        // Runs of identifier chars ([alnum]+ including `_`).
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut start: Option<usize> = None;
+        for (bi, c) in text.char_indices() {
+            let ident = c.is_alphanumeric() || c == '_';
+            match (start, ident) {
+                (None, true) => start = Some(bi),
+                (Some(s), false) => {
+                    runs.push((s, bi));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            runs.push((s, text.len()));
+        }
+
+        for (rs, re) in runs {
+            for (ps, pe) in split_identifier(&text[rs..re]) {
+                let (from, to) = (rs + ps, rs + pe);
+                if to - from > MAX_TOKEN_BYTES {
+                    continue;
+                }
+                tokens.push(Token {
+                    offset_from: from,
+                    offset_to: to,
+                    position,
+                    text: text[from..to].to_lowercase(),
+                    position_length: 1,
+                });
+                position += 1;
+            }
+        }
+        VecTokenStream { tokens, idx: 0 }
+    }
+}
+
+/// Split one identifier run into sub-word byte spans (relative to the run):
+/// at `_` (dropped), at lower/digit→Upper boundaries, and at the last
+/// capital of an acronym run when followed by lowercase.
+fn split_identifier(word: &str) -> Vec<(usize, usize)> {
+    let chars: Vec<(usize, char)> = word.char_indices().collect();
+    let mut spans = Vec::new();
+    let mut start: Option<usize> = None;
+    for i in 0..chars.len() {
+        let (bi, c) = chars[i];
+        if c == '_' {
+            if let Some(s) = start.take() {
+                spans.push((s, bi));
+            }
+            continue;
+        }
+        let Some(s) = start else {
+            start = Some(bi);
+            continue;
+        };
+        let prev = chars[i - 1].1;
+        let camel_boundary = (prev.is_lowercase() || prev.is_numeric()) && c.is_uppercase();
+        let acronym_boundary = prev.is_uppercase()
+            && c.is_uppercase()
+            && chars.get(i + 1).is_some_and(|&(_, n)| n.is_lowercase());
+        if camel_boundary || acronym_boundary {
+            spans.push((s, bi));
+            start = Some(bi);
+        }
+    }
+    if let Some(s) = start {
+        spans.push((s, word.len()));
+    }
+    spans
+}
+
+/// Pre-materialized token stream — the token set is computed eagerly in
+/// `token_stream` (identifier splitting needs lookahead anyway).
+struct VecTokenStream {
+    tokens: Vec<Token>,
+    idx: usize,
+}
+
+impl TokenStream for VecTokenStream {
+    fn advance(&mut self) -> bool {
+        if self.idx < self.tokens.len() {
+            self.idx += 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn token(&self) -> &Token {
+        &self.tokens[self.idx - 1]
+    }
+    fn token_mut(&mut self) -> &mut Token {
+        &mut self.tokens[self.idx - 1]
+    }
 }
 
 // Suppress dead-code warnings for index/field accessors used only by `Bm25Search`.
@@ -195,19 +347,31 @@ impl Bm25Search {
         let (_schema, fields) = build_schema();
         let index = Index::open_in_dir(path)
             .with_context(|| format!("opening tantivy index for search in {}", path.display()))?;
+        register_code_tokenizer(&index);
         Ok(Self { index, fields })
     }
 
-    /// BM25-rank documents by relevance to `query`. The query is parsed with
-    /// tantivy's standard `QueryParser` on the `content` field — supports
-    /// implicit OR over terms, quoted phrases, `field:value` syntax, etc.
+    /// BM25-rank documents by relevance to `query`.
+    ///
+    /// Two defenses against QueryParser syntax in natural-language queries:
+    /// `:` is replaced by a space before parsing (we only ever search the
+    /// `content` field, so `field:value` syntax is never useful — but
+    /// `Watcher::run` would otherwise parse as a clause on a nonexistent
+    /// field and be dropped), and the rest is parsed leniently so stray
+    /// quotes / `+` / `-` can't fail the whole search.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SparseHit>> {
         let reader = self.index.reader().context("creating tantivy reader")?;
         let searcher = reader.searcher();
         let parser = QueryParser::for_index(&self.index, vec![self.fields.content]);
-        let q = parser
-            .parse_query(query)
-            .with_context(|| format!("parsing bm25 query: {}", query))?;
+        let sanitized = query.replace(':', " ");
+        let (q, parse_errors) = parser.parse_query_lenient(&sanitized);
+        if !parse_errors.is_empty() {
+            tracing::debug!(
+                query = %query,
+                errors = ?parse_errors,
+                "bm25 query parsed leniently (some clauses dropped)"
+            );
+        }
         let top = searcher
             .search(&q, &TopDocs::with_limit(limit))
             .context("running bm25 search")?;
@@ -258,4 +422,134 @@ fn extract_str(doc: &TantivyDocument, field: Field) -> String {
 
 fn extract_u64(doc: &TantivyDocument, field: Field) -> u64 {
     doc.get_first(field).and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokens(text: &str) -> Vec<String> {
+        let mut t = CodeTokenizer;
+        let mut stream = t.token_stream(text);
+        let mut out = Vec::new();
+        while stream.advance() {
+            out.push(stream.token().text.clone());
+        }
+        out
+    }
+
+    #[test]
+    fn tok_snake_case_splits() {
+        assert_eq!(
+            tokens("build_si_portfolio"),
+            vec!["build", "si", "portfolio"]
+        );
+    }
+
+    #[test]
+    fn tok_camel_case_splits() {
+        assert_eq!(tokens("buildSiPortfolio"), vec!["build", "si", "portfolio"]);
+        assert_eq!(tokens("AdaptiveBatcher"), vec!["adaptive", "batcher"]);
+    }
+
+    #[test]
+    fn tok_acronym_boundary() {
+        assert_eq!(tokens("HTTPServer"), vec!["http", "server"]);
+        // Trailing acronym stays whole.
+        assert_eq!(tokens("parseJSON"), vec!["parse", "json"]);
+    }
+
+    #[test]
+    fn tok_digits_stay_attached() {
+        assert_eq!(tokens("bm25"), vec!["bm25"]);
+        assert_eq!(tokens("Server2"), vec!["server2"]);
+    }
+
+    #[test]
+    fn tok_prose_unchanged() {
+        assert_eq!(
+            tokens("adaptive batching, halving on failure!"),
+            vec!["adaptive", "batching", "halving", "on", "failure"]
+        );
+    }
+
+    #[test]
+    fn tok_qualified_path() {
+        // `::` is a separator (not an identifier char), so qualified names
+        // split into their segments' parts.
+        assert_eq!(
+            tokens("AdaptiveBatcher::note_failure"),
+            vec!["adaptive", "batcher", "note", "failure"]
+        );
+    }
+
+    #[test]
+    fn tok_underscore_runs_and_empties() {
+        assert_eq!(tokens("__init__"), vec!["init"]);
+        assert_eq!(tokens("____"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn tok_cyrillic_lowercased() {
+        assert_eq!(tokens("Адаптивный Батчер"), vec!["адаптивный", "батчер"]);
+    }
+
+    /// End-to-end through a real tantivy index: snake_case-indexed content
+    /// is found by camelCase, by a sub-word, and by the exact identifier;
+    /// QueryParser-syntax queries (`::`) don't error.
+    #[test]
+    fn e2e_cross_style_identifier_search() {
+        let dir = std::env::temp_dir().join(format!(
+            "code-search-mcp-bm25-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut idx = Bm25Index::open(&dir).unwrap();
+        idx.upsert(
+            "src/portfolio.rs",
+            "chunk-1",
+            10,
+            40,
+            "rust",
+            "pub fn build_si_portfolio(deposit: Decimal) -> Engine { }",
+        )
+        .unwrap();
+        idx.upsert(
+            "src/other.rs",
+            "chunk-2",
+            1,
+            5,
+            "rust",
+            "fn unrelated_helper() {}",
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        drop(idx);
+
+        let search = Bm25Search::open(&dir).unwrap();
+        for query in [
+            "build_si_portfolio",
+            "buildSiPortfolio",
+            "portfolio sizing",
+            "Portfolio::build_si_portfolio",
+        ] {
+            let hits = search.search(query, 5).unwrap();
+            assert!(
+                hits.iter().any(|h| h.chunk_id == "chunk-1"),
+                "query {:?} should find chunk-1, got {:?}",
+                query,
+                hits.iter().map(|h| h.chunk_id.clone()).collect::<Vec<_>>()
+            );
+        }
+        // Garbage QueryParser syntax must not error out.
+        let hits = search.search("\"unbalanced AND build_si_portfolio", 5);
+        assert!(hits.is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

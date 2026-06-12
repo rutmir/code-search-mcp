@@ -2,6 +2,35 @@
 
 History of significant changes. Newest at the top. Dates are when work landed locally; this project doesn't tag releases yet.
 
+## 2026-06-12 — v0.0.3
+
+**⚠ Upgrade note: the first `index` / `serve` start after this upgrade auto-clears and fully rebuilds the index** (BM25 schema revision bumped for the new tokenizer; re-embeds the whole corpus — plan for first-index duration).
+
+### Code-aware BM25 tokenizer
+
+The `content` field is now tokenized with identifier awareness: snake_case and camelCase split into sub-words (`build_si_portfolio` ↔ `buildSiPortfolio` ↔ "portfolio" all match each other), acronym boundaries respected (`HTTPServer` → `http`, `server`), digits stay attached (`bm25` whole). Only the parts are emitted — tantivy's QueryParser turns a multi-token word into a phrase query, so an exact identifier in the query still matches precisely as a consecutive phrase, including across naming styles.
+
+BM25 queries are also sanitized (`:` → space; we only search `content`, so `field:value` syntax is never useful) and parsed leniently — previously `Watcher::run` parsed as a clause on a nonexistent field `Watcher` and could fail or silently drop the term.
+
+`bm25::SCHEMA_VERSION` (new) feeds the marker's `config_hard` fingerprint — the auto-clear flow handles the migration.
+
+### Exact-symbol boost
+
+`[search].symbol_boost` (default 1.0): a chunk whose AST symbol is literally named in the query (`AdaptiveBatcher::note_failure`, tail segment `note_failure`, or verbatim `Indexer`) gets one extra #1 rank-vote in the RRF, applied before the rerank-head split so the match also earns a rerank slot. Ambiguity guard: plain lowercase English words (`run`, `new`) don't trigger it; identifier-likeness (underscores, `::`, camelCase, verbatim PascalCase) is required. This closes the main "legitimate grep fallback" — known-symbol lookups.
+
+### Opt-in query log
+
+`[serve].query_log_path`: one JSON line per `code_search` call (ts, query, filters, latency, result count, reranked flag, top-3 hits). MCP clients (Claude Code included) don't persist server stderr beyond connection start, so this is the only durable record of what the LLM asked and what came back. Off by default.
+
+### `check` warns on chunking vs reranker-truncation mismatch
+
+If any `chunking.max_chunk_chars` (default or per-language) exceeds `reranker.max_document_chars`, `check` warns that the cross-encoder will rank such chunks by their truncated head only.
+
+### Housekeeping
+
+- `rust-version = "1.88"` declared in Cargo.toml (computed from the dependency tree; README/CONTRIBUTING previously claimed 1.75+ which hasn't been true for a while)
+- `examples/CLAUDE.md` tip: phrase queries in English — the reference embedding model is English-code-trained, the dense leg is weaker on non-English queries
+
 ## 2026-06-12 — v0.0.2
 
 ### Reranker resilience: halve-and-retry on "too large", visible RRF fallback

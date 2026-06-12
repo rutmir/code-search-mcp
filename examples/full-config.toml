@@ -130,6 +130,18 @@ debounce_ms = 500
 #                     # 2.0 = strong vote, not a veto: a candidate both retrieval
 #                     # sides rank highly survives a single cross-encoder miss.
 #                     # 0.0 = rank purely by RRF (rerank scores still reported).
+# symbol_boost = 1.0  # extra #1 rank-vote for chunks whose AST symbol is literally
+#                     # named in the query ("AdaptiveBatcher::note_failure",
+#                     # "build_si_portfolio", "Indexer"). Makes code_search
+#                     # competitive with grep for exact-symbol lookups. 0.0 disables.
+
+# Optional serve-mode block.
+# [serve]
+# One JSON line per code_search call: ts, query, filters, result count,
+# latency, top hits. MCP clients don't persist server stderr, so this file
+# is the only durable record of what was asked — useful for tuning
+# retrieval quality. Off by default; `~` and env vars expand.
+# query_log_path = "~/.local/state/code-search-mcp/myproject/queries.jsonl"
 
 [chunking]
 # Available strategies:

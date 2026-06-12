@@ -33,6 +33,7 @@ const DEFAULT_K_SPARSE: usize = 30;
 const DEFAULT_RERANK_TOP_N: usize = 30;
 const DEFAULT_RRF_K: usize = 60;
 const DEFAULT_RERANK_WEIGHT: f32 = 2.0;
+const DEFAULT_SYMBOL_BOOST: f32 = 1.0;
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -168,15 +169,11 @@ pub async fn run(config: &Config, params: SearchParams<'_>) -> Result<Vec<Search
     }
 
     let mut merged: Vec<Candidate> = by_id.into_values().collect();
-    merged.sort_by(|a, b| {
-        b.rrf
-            .partial_cmp(&a.rrf)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
     if merged.is_empty() {
         return Ok(Vec::new());
     }
+    // Sorting happens below, after the symbol boost — which needs the
+    // kind/name metadata filled in for sparse-only candidates first.
 
     // Fill kind/name for sparse-only candidates. BM25's tantivy schema
     // doesn't carry the AST metadata (would require an incompatible
@@ -211,6 +208,31 @@ pub async fn run(config: &Config, params: SearchParams<'_>) -> Result<Vec<Search
             }
         }
     }
+
+    // Exact-symbol boost: when the query literally names a chunk's symbol
+    // (`AdaptiveBatcher::note_failure`, `build_si_portfolio`, `Indexer`),
+    // that chunk gets one extra #1 rank-vote. This is what lets
+    // `code_search` win the "I know the symbol, find it" queries that
+    // would otherwise justify falling back to grep. Applied to the RRF
+    // before the head split so a symbol match also earns a rerank slot.
+    let symbol_boost = config.search.symbol_boost.unwrap_or(DEFAULT_SYMBOL_BOOST);
+    if symbol_boost > 0.0 {
+        let bonus = symbol_boost / (rrf_k as f32 + 1.0);
+        for c in merged.iter_mut() {
+            if let Some(name) = &c.name {
+                if query_names_symbol(params.query, name) {
+                    debug!(file = %c.file, name = %name, "exact symbol match — boosting");
+                    c.rrf += bonus;
+                }
+            }
+        }
+    }
+
+    merged.sort_by(|a, b| {
+        b.rrf
+            .partial_cmp(&a.rrf)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     debug!(
         merged = merged.len(),
@@ -379,6 +401,59 @@ fn fuse_rerank_votes(rrf: &[f32], rerank: &[f32], rrf_k: usize, weight: f32) -> 
     fused
 }
 
+/// Does the query literally name this symbol?
+///
+/// Query tokens are runs of identifier-ish chars (`[A-Za-z0-9_:.]`). A
+/// token matches when it equals the full (possibly qualified) name, or
+/// the name's tail segment (after the last `::` / `.`). To avoid boosting
+/// every chunk named `run` when the query merely contains the English
+/// word "run", a match requires the token to *look like an identifier*:
+/// contain `_`, `::`, `.`, an interior uppercase letter (camelCase), or —
+/// for plain names — equal the name case-sensitively while the name is
+/// capitalized (PascalCase types referenced verbatim, e.g. "Indexer").
+/// Consequence: single-word lowercase symbols (`run`, `new`, `main`) are
+/// only boosted when qualified in the query (`Watcher::run`).
+fn query_names_symbol(query: &str, name: &str) -> bool {
+    fn is_identifier_like(t: &str) -> bool {
+        t.contains('_')
+            || t.contains("::")
+            || t.contains('.')
+            || t.chars().skip(1).any(|c| c.is_uppercase())
+    }
+    let name_is_qualified = name.contains("::") || name.contains('.');
+    let name_tail = name
+        .rsplit("::")
+        .next()
+        .and_then(|s| s.rsplit('.').next())
+        .unwrap_or(name);
+    let name_lc = name.to_lowercase();
+    let tail_lc = name_tail.to_lowercase();
+
+    for raw in query.split(|ch: char| !(ch.is_alphanumeric() || "_:.".contains(ch))) {
+        let t = raw.trim_matches(|ch: char| ch == ':' || ch == '.');
+        if t.is_empty() {
+            continue;
+        }
+        let t_lc = t.to_lowercase();
+        // Full name match: qualified names are unambiguous on their own;
+        // plain names need an identifier-like token or a verbatim
+        // case-sensitive match on a capitalized name.
+        if t_lc == name_lc
+            && (name_is_qualified
+                || is_identifier_like(t)
+                || (t == name && name.starts_with(char::is_uppercase)))
+        {
+            return true;
+        }
+        // Tail-segment match (`note_failure` finding
+        // `AdaptiveBatcher::note_failure`) — identifier-like tokens only.
+        if name_is_qualified && t_lc == tail_lc && is_identifier_like(t) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Move a Candidate into a SearchResult with the given `final_score` and
 /// `rerank_score`. Centralizes the field copy so kind/name don't drift
 /// between the four ranking paths (reranked head, RRF fallback head,
@@ -459,6 +534,59 @@ mod tests {
         for (f, r) in fused.iter().zip(rrf.iter()) {
             assert!(f >= r);
         }
+    }
+
+    #[test]
+    fn symbol_match_qualified_name_in_query() {
+        assert!(query_names_symbol(
+            "AdaptiveBatcher::note_failure timeout handling",
+            "AdaptiveBatcher::note_failure"
+        ));
+        assert!(query_names_symbol(
+            "where is Watcher::run started",
+            "Watcher::run"
+        ));
+        // Dot-qualified (Python / TS / Go style).
+        assert!(query_names_symbol(
+            "Portfolio.buildSiPortfolio helper",
+            "Portfolio.buildSiPortfolio"
+        ));
+    }
+
+    #[test]
+    fn symbol_match_tail_segment() {
+        assert!(query_names_symbol(
+            "note_failure logic",
+            "AdaptiveBatcher::note_failure"
+        ));
+        assert!(query_names_symbol(
+            "buildSiPortfolio deposit sizing",
+            "Portfolio.buildSiPortfolio"
+        ));
+        // Plain lowercase tail ("run") is ambiguous English — no boost.
+        assert!(!query_names_symbol("how does run work", "Watcher::run"));
+    }
+
+    #[test]
+    fn symbol_match_plain_names() {
+        // snake_case identifiers are unambiguous.
+        assert!(query_names_symbol(
+            "where is build_si_portfolio defined",
+            "build_si_portfolio"
+        ));
+        // PascalCase type referenced verbatim.
+        assert!(query_names_symbol("the Indexer struct fields", "Indexer"));
+        // Lowercase English word vs lowercase fn name — too ambiguous.
+        assert!(!query_names_symbol("running the main loop", "run"));
+        assert!(!query_names_symbol("a new approach", "new"));
+        // Sentence-capitalized English word vs lowercase fn name.
+        assert!(!query_names_symbol("Run the loop", "run"));
+    }
+
+    #[test]
+    fn symbol_match_qualified_query_does_not_hit_bare_tail() {
+        // Query names `Watcher::run`; a free function `run` must NOT match.
+        assert!(!query_names_symbol("Watcher::run shutdown", "run"));
     }
 
     #[test]

@@ -50,6 +50,8 @@ Use Grep / Read / Bash directly only when:
 
 **Tip**: concise queries (3-10 words) outperform long descriptions. The reranker sees more signal in a tight phrase.
 
+**Tip**: phrase queries in **English**, even when discussing the project in another language. The reference embedding model (`jina-code-embeddings`) is trained on English-code pairs — the dense leg is noticeably weaker on non-English queries, while identifiers and keywords in the query work equally well either way (BM25 leg).
+
 ---
 
 ## Project-specific notes

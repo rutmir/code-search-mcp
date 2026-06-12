@@ -476,6 +476,9 @@ async fn handle_tools_call(config: &Config, msg: &Value) -> Result<Value, (i32, 
                 results = results.len(),
                 elapsed_ms, "tools/call code_search completed"
             );
+            if let Some(log_path) = &config.serve.query_log_path {
+                append_query_log(log_path, query, lang, path, limit, elapsed_ms, &results);
+            }
             let rerank_expected = config.reranker.as_ref().is_some_and(|r| r.enabled);
             Ok(json!({
                 "content": [{
@@ -499,6 +502,63 @@ async fn handle_tools_call(config: &Config, msg: &Value) -> Result<Value, (i32, 
                 "isError": true
             }))
         }
+    }
+}
+
+/// Append one JSON line describing a completed `code_search` call to the
+/// query log. Durable observability: MCP clients don't persist server
+/// stderr, so without this file there is no record of what was asked.
+/// Best-effort — a failed write warns and never fails the search.
+fn append_query_log(
+    path: &std::path::Path,
+    query: &str,
+    lang: Option<&str>,
+    path_filter: Option<&str>,
+    limit: usize,
+    elapsed_ms: u64,
+    results: &[search::SearchResult],
+) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let top: Vec<Value> = results
+        .iter()
+        .take(3)
+        .map(|r| {
+            json!({
+                "file": r.file,
+                "lines": format!("{}-{}", r.start_line, r.end_line),
+                "score": r.score,
+                "rerank": r.rerank_score,
+            })
+        })
+        .collect();
+    let entry = json!({
+        "ts": ts,
+        "query": query,
+        "lang": lang,
+        "path": path_filter,
+        "limit": limit,
+        "elapsed_ms": elapsed_ms,
+        "results": results.len(),
+        "reranked": results.iter().any(|r| r.rerank_score.is_some()),
+        "top": top,
+    });
+    let line = format!("{}\n", entry);
+    let write = || -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        f.write_all(line.as_bytes())
+    };
+    if let Err(e) = write() {
+        warn!(path = %path.display(), error = %e, "query log append failed");
     }
 }
 

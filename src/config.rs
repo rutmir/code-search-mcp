@@ -19,6 +19,9 @@ pub struct Config {
     /// hardware-specific tuning without a recompile.
     #[serde(default)]
     pub search: SearchConfig,
+    /// Optional serve-mode block.
+    #[serde(default)]
+    pub serve: ServeConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -40,6 +43,25 @@ pub struct SearchConfig {
     /// modalities — a strong vote, not a veto. Set to 0.0 to rank purely
     /// by retrieval RRF while still reporting rerank scores.
     pub rerank_weight: Option<f32>,
+    /// Boost for candidates whose AST symbol name is literally named in
+    /// the query (e.g. query "AdaptiveBatcher::note_failure timeout"
+    /// hitting the chunk named `AdaptiveBatcher::note_failure`), in units
+    /// of a #1 rank-vote: `bonus = symbol_boost / (rrf_k + 1)`.
+    /// Default 1.0; 0.0 disables. Makes `code_search` competitive with
+    /// grep for exact-symbol lookups.
+    pub symbol_boost: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ServeConfig {
+    /// When set, `serve` appends one JSON line per `code_search` call to
+    /// this file: timestamp, query, filters, result count, latency, and
+    /// the top hits. MCP clients (Claude Code included) do not persist
+    /// the server's stderr beyond connection start, so this is the only
+    /// durable record of what was asked and what came back — invaluable
+    /// when tuning retrieval quality or diagnosing why the calling LLM
+    /// stopped using the tool. Off by default; `~` and env vars expand.
+    pub query_log_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -275,6 +297,9 @@ impl Config {
 
         cfg.project.root = expand_path(&cfg.project.root)?;
         cfg.bm25.index_path = expand_path(&cfg.bm25.index_path)?;
+        if let Some(p) = &cfg.serve.query_log_path {
+            cfg.serve.query_log_path = Some(expand_path(p)?);
+        }
 
         if !cfg.project.root.exists() {
             anyhow::bail!(

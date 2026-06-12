@@ -1,7 +1,10 @@
 [package]
 name = "code-search-mcp"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
+# Highest MSRV in the dependency tree (`time` 0.3 family as of 2026-06).
+# Verify with: cargo metadata | jq '.packages[].rust_version' | sort -V
+rust-version = "1.88"
 description = "Token-saving MCP server for hybrid code search: tree-sitter chunking + BM25 + dense embeddings + cross-encoder rerank"
 license = "MIT OR Apache-2.0"
 publish = false

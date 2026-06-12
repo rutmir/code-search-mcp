@@ -21,7 +21,7 @@ If you're touching language support, the pattern is: add the crate to `Cargo.tom
 
 ## Prerequisites
 
-- **Rust toolchain** — stable 1.75+ (rustup recommended)
+- **Rust toolchain** — stable, MSRV 1.88 (declared in `Cargo.toml`; rustup recommended)
 - **docker / docker-compose** — for the three external services you'll need at integration-test time
 
 ## Dev stack (for E2E work)

@@ -59,6 +59,12 @@ pub fn config_hard_fingerprint(config: &Config) -> String {
     h.update(config.embedding.model.as_bytes());
     h.update(b"\0");
     h.update(config.embedding.dimensions.to_le_bytes());
+    // Tantivy schema/tokenizer revision: a bump invalidates the local BM25
+    // index, and the only rebuild path that refills tantivy is the full
+    // reprocess (the indexer's cache is Qdrant ∩ tantivy), so it rides the
+    // hard fingerprint.
+    h.update(b"\0bm25_schema\0");
+    h.update(crate::bm25::SCHEMA_VERSION.to_le_bytes());
     hex::encode(h.finalize())
 }
 

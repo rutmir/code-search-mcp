@@ -15,6 +15,7 @@ When Claude Code explores a codebase to answer a question, it currently does it 
 
 - **Hybrid retrieval** — dense semantic embeddings + sparse BM25 + cross-encoder reranking together outperform any single signal
 - **AST-aware chunking** — chunks aligned to function / class / method boundaries via tree-sitter for 9 languages; the LLM sees `fn AdaptiveBatcher::note_failure` headers, not raw line ranges
+- **Code-aware matching** — the BM25 tokenizer splits snake_case / camelCase identifiers (`buildSiPortfolio` finds `build_si_portfolio`), and a query that literally names a symbol boosts that chunk to the top — exact-symbol lookups don't need grep
 - **Quality-first defaults** — recall is the lever, latency is not. A 2-minute search that finds the right answer beats a 10-second search that misses
 
 **Typical savings: 30–100×** on tokens for code exploration, with equal or better recall.
@@ -92,7 +93,7 @@ You'll need three running services. The recommended setup is `docker-compose` on
 - **[llama.cpp server](https://github.com/ggml-org/llama.cpp)** running an embedding model. The reference stack uses [`jina-code-embeddings-0.5b`](https://huggingface.co/jinaai/jina-code-embeddings-0.5b) (896-dim, code-specialized). Default port `7788`.
 - **[llama.cpp server](https://github.com/ggml-org/llama.cpp)** running a cross-encoder reranker. The recommended model is [`BAAI/bge-reranker-v2-m3`](https://huggingface.co/BAAI/bge-reranker-v2-m3) (8192 ctx, multilingual). Default port `7799`.
 
-A Rust toolchain is needed to build the binary. Tested with stable 1.75+.
+A Rust toolchain is needed to build the binary. MSRV is 1.88 (declared in `Cargo.toml`; driven by the dependency tree).
 
 ### Reference docker-compose
 
@@ -322,6 +323,10 @@ The minimal config above is enough for most setups. Optional knobs you may want 
 - `dense_k`, `sparse_k`, `rerank_top_n` (all default 30) — top-K from each modality + rerank ceiling. Drop to 15–20 for ~30–40% faster searches at recall cost
 - `rrf_k` (default 60) — Reciprocal Rank Fusion constant per Cormack et al.
 - `rerank_weight` (default 2.0) — the reranker's rank-vote weight in the final fusion, relative to one retrieval modality. The cross-encoder's opinion is fused into the dense+sparse RRF as a third rank-vote rather than replacing the score outright, so a candidate both retrieval sides agree on survives a single reranker miss. `0.0` ranks purely by RRF (rerank scores still reported per-hit)
+- `symbol_boost` (default 1.0) — extra #1 rank-vote for chunks whose AST symbol is literally named in the query (`AdaptiveBatcher::note_failure`, `build_si_portfolio`, `Indexer`). Makes `code_search` competitive with grep for exact-symbol lookups. Ambiguous plain English words (`run`, `new`) don't trigger it. `0.0` disables
+
+**`[serve]`** (all fields optional)
+- `query_log_path` — when set, `serve` appends one JSON line per `code_search` call (timestamp, query, filters, latency, top hits). MCP clients don't persist the server's stderr, so this file is the only durable record of what was asked and what came back — useful when tuning retrieval quality. Off by default
 
 **`[chunking]`** and **`[chunking.per_language.<lang>]`**
 - Changes to chunking parameters (strategy, max_chunk_lines, overlap_lines, max_chunk_chars, per-language overrides) trigger an **auto-clear + rebuild** on the next `index` because chunk identity changes. This is the right behavior, just be aware of it
@@ -371,7 +376,7 @@ The reranker server is down, slow, or persistently rejecting requests. Check the
 Your `vector_store.collection` points at someone else's collection (different project_id or root path). Either fix the config, rename the collection, or `clear --yes` to wipe and start fresh.
 
 **`config-hard change detected ... AUTO-CLEARING the collection`**
-You changed `chunking` or `embedding` parameters since the last index. This is expected behavior — the indexer detected the change and is rebuilding cleanly. If it was an accidental edit, ctrl-C immediately and revert the config.
+You changed `chunking` or `embedding` parameters since the last index — or upgraded to a binary with a newer BM25 schema/tokenizer revision (noted in the [changelog](docs/CHANGELOG.md)). This is expected behavior: the indexer detected the change and is rebuilding cleanly, which re-embeds the whole corpus (plan for the same duration as the first index). If it was an accidental config edit, ctrl-C immediately and revert.
 
 **Search returns results from an unrelated project**
 Auto-derive prevents this for default setups, but if you copied a config from one project to another without changing `project.id` (and explicitly set the same `vector_store.collection` in both), the marker check should still catch it on the next `index`. If somehow it doesn't, `clear --yes` and re-index.
