@@ -1,5 +1,5 @@
 //! Hybrid search: dense (Qdrant) ∪ sparse (BM25/tantivy) → RRF merge →
-//! optional rerank (jina-reranker-v2) → ranked list.
+//! optional cross-encoder rerank fused back into the RRF → ranked list.
 //!
 //! Why RRF instead of normalized score weighting? Dense uses cosine
 //! similarity (0..1, near-1 for relevant), BM25 uses a raw score
@@ -7,6 +7,14 @@
 //! per-modality normalization that depends on the score distribution
 //! of the corpus — fragile. Reciprocal Rank Fusion sidesteps this by
 //! only looking at *rank*, which is comparable across modalities.
+//!
+//! The reranker is folded in the same way: it contributes a third
+//! rank-vote (weighted by `[search].rerank_weight`) on top of the
+//! dense+sparse RRF, instead of replacing the final score outright.
+//! A cross-encoder is the best single judge of relevance, but giving
+//! it veto power lets one model error sink a candidate both retrieval
+//! modalities agree on — fusing ranks keeps the retrieval consensus
+//! in play.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -24,6 +32,7 @@ const DEFAULT_K_DENSE: usize = 30;
 const DEFAULT_K_SPARSE: usize = 30;
 const DEFAULT_RERANK_TOP_N: usize = 30;
 const DEFAULT_RRF_K: usize = 60;
+const DEFAULT_RERANK_WEIGHT: f32 = 2.0;
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -31,8 +40,9 @@ pub struct SearchResult {
     pub start_line: u64,
     pub end_line: u64,
     pub lang: String,
-    /// Final score used for ranking: reranker score if rerank was on,
-    /// otherwise the RRF score.
+    /// Final score used for ranking. With rerank on: dense+sparse RRF
+    /// plus the reranker's weighted rank-vote (see module docs).
+    /// Without rerank: plain RRF score.
     pub score: f32,
     /// Component scores, for inspection / debugging.
     pub dense_score: Option<f32>,
@@ -212,8 +222,11 @@ pub async fn run(config: &Config, params: SearchParams<'_>) -> Result<Vec<Search
     //    a) Split merged into head (top rerank_top_n by RRF) and tail (rest).
     //    b) Upgrade head's previews to full chunk content (bm25 lookup for
     //       dense-only candidates; BM25-side hits already have full text).
-    //    c) Cross-encoder ranks the head; tail keeps RRF score.
-    //    d) Final list = reranked_head + tail (in that order), trimmed to
+    //    c) Cross-encoder scores the head; its rank-vote is fused into the
+    //       head's RRF scores. Tail keeps plain RRF score — consistent,
+    //       since every head candidate's fused score ≥ its RRF score ≥
+    //       any tail RRF score.
+    //    d) Final list = fused_head + tail (in that order), trimmed to
     //       params.limit. For default config (limit=10, top_n=20), all
     //       returned results are reranked.
     //
@@ -266,10 +279,16 @@ pub async fn run(config: &Config, params: SearchParams<'_>) -> Result<Vec<Search
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "reranked head"
                 );
+                let weight = config.search.rerank_weight.unwrap_or(DEFAULT_RERANK_WEIGHT);
+                let rrf_scores: Vec<f32> = head.iter().map(|c| c.rrf).collect();
+                let fused = fuse_rerank_votes(&rrf_scores, &scores, rrf_k, weight);
                 let mut with_scores: Vec<SearchResult> = head
                     .into_iter()
-                    .zip(scores.into_iter())
-                    .map(|(c, rer_score)| candidate_to_result(c, rer_score, Some(rer_score)))
+                    .zip(scores)
+                    .zip(fused)
+                    .map(|((c, rer_score), final_score)| {
+                        candidate_to_result(c, final_score, Some(rer_score))
+                    })
                     .collect();
                 with_scores.sort_by(|a, b| {
                     b.score
@@ -335,6 +354,31 @@ struct Candidate {
     name: Option<String>,
 }
 
+/// Fuse the cross-encoder's opinion into the retrieval RRF by *rank*,
+/// not by raw score — reranker logits (≈ −10..+10) and RRF scores
+/// (≈ 0.01..0.05) live on incomparable scales, the same argument that
+/// picked RRF over score-weighting for dense+sparse in the first place.
+///
+/// `fused[i] = rrf[i] + weight / (rrf_k + rerank_rank_of_i + 1)` — the
+/// reranker contributes one more rank-vote with `weight` times the pull
+/// of a single retrieval modality. A candidate both retrieval sides
+/// agree on survives one bad cross-encoder call; ties among
+/// retrieval-equals are still broken by the reranker.
+fn fuse_rerank_votes(rrf: &[f32], rerank: &[f32], rrf_k: usize, weight: f32) -> Vec<f32> {
+    debug_assert_eq!(rrf.len(), rerank.len());
+    let mut order: Vec<usize> = (0..rerank.len()).collect();
+    order.sort_by(|&a, &b| {
+        rerank[b]
+            .partial_cmp(&rerank[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut fused = rrf.to_vec();
+    for (rank, &idx) in order.iter().enumerate() {
+        fused[idx] += weight / (rrf_k as f32 + rank as f32 + 1.0);
+    }
+    fused
+}
+
 /// Move a Candidate into a SearchResult with the given `final_score` and
 /// `rerank_score`. Centralizes the field copy so kind/name don't drift
 /// between the four ranking paths (reranked head, RRF fallback head,
@@ -352,5 +396,78 @@ fn candidate_to_result(c: Candidate, final_score: f32, rerank_score: Option<f32>
         preview: c.content.unwrap_or(c.preview),
         kind: c.kind,
         name: c.name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rank order of the fused scores, best first.
+    fn ranking(fused: &[f32]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..fused.len()).collect();
+        order.sort_by(|&a, &b| fused[b].partial_cmp(&fused[a]).unwrap());
+        order
+    }
+
+    #[test]
+    fn fuse_empty_input() {
+        assert!(fuse_rerank_votes(&[], &[], 60, 2.0).is_empty());
+    }
+
+    #[test]
+    fn fuse_retrieval_consensus_survives_reranker_miss() {
+        // Doc 0: top of both retrieval modalities (rrf = 1/61 + 1/61),
+        // but the reranker puts it dead last of three.
+        // Doc 1: weak retrieval (rank ~25 in one modality), reranker's #1.
+        // Doc 2: middling everywhere.
+        let rrf = [2.0 / 61.0, 1.0 / 85.0, 1.0 / 70.0];
+        let rerank = [-3.2, 0.8, -1.4];
+        let fused = fuse_rerank_votes(&rrf, &rerank, 60, 2.0);
+        // Retrieval consensus outweighs the reranker's lone top vote;
+        // among the two weak-retrieval docs the higher RRF (doc 2) edges
+        // out the reranker's favorite because their rank bonuses are
+        // adjacent (2/62 vs 2/61) while their RRF gap is bigger.
+        assert_eq!(ranking(&fused), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn fuse_reranker_breaks_retrieval_ties() {
+        // Equal RRF — the reranker's vote is the only differentiator.
+        let rrf = [1.0 / 61.0; 3];
+        let rerank = [-5.0, 7.0, 1.0];
+        let fused = fuse_rerank_votes(&rrf, &rerank, 60, 2.0);
+        assert_eq!(ranking(&fused), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn fuse_zero_weight_is_pure_rrf() {
+        let rrf = [0.03, 0.01, 0.02];
+        let rerank = [-9.0, 9.0, 0.0];
+        let fused = fuse_rerank_votes(&rrf, &rerank, 60, 0.0);
+        assert_eq!(fused.to_vec(), rrf.to_vec());
+    }
+
+    #[test]
+    fn fuse_scores_never_below_rrf() {
+        // Fused = RRF + non-negative bonus, so every head candidate keeps
+        // at least its RRF score — this is what keeps head-above-tail
+        // ordering consistent in run().
+        let rrf = [0.033, 0.012, 0.016, 0.020];
+        let rerank = [0.78, 0.30, -1.41, -3.34];
+        let fused = fuse_rerank_votes(&rrf, &rerank, 60, 2.0);
+        for (f, r) in fused.iter().zip(rrf.iter()) {
+            assert!(f >= r);
+        }
+    }
+
+    #[test]
+    fn fuse_handles_tied_rerank_scores() {
+        // Ties in rerank scores must not panic and must keep RRF ordering
+        // influence intact.
+        let rrf = [0.02, 0.03];
+        let rerank = [1.0, 1.0];
+        let fused = fuse_rerank_votes(&rrf, &rerank, 60, 2.0);
+        assert_eq!(ranking(&fused), vec![1, 0]);
     }
 }

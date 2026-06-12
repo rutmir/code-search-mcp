@@ -34,6 +34,12 @@ pub struct SearchConfig {
     /// Reciprocal Rank Fusion constant. Smaller favors top-of-list
     /// matches more aggressively; 60 is the Cormack et al. default.
     pub rrf_k: Option<usize>,
+    /// Weight of the reranker's rank-vote in the final fusion, relative
+    /// to a single retrieval modality (dense or sparse each contribute
+    /// with weight 1). Default 2.0: the cross-encoder counts as two
+    /// modalities — a strong vote, not a veto. Set to 0.0 to rank purely
+    /// by retrieval RRF while still reporting rerank scores.
+    pub rerank_weight: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -166,11 +172,12 @@ pub struct RerankerConfig {
     pub enabled: bool,
     #[serde(default = "default_reranker_timeout")]
     pub timeout_secs: u64,
-    /// Truncate each candidate document to this many bytes before sending
-    /// to the reranker. Sized for jina-reranker-v2 at its default ctx=1024:
-    /// query (~30 tok) + doc (~830 tok ≈ 2500 chars at 3:1) fits.
-    /// If your reranker server has `-c 8192` or bigger, bump this to ~8000
-    /// for better quality (more chunk context → better ranking).
+    /// Truncate each candidate document to this many chars before sending
+    /// to the reranker. Default 8000 — sized for bge-reranker-v2-m3 at its
+    /// native ctx=8192 (8000 chars ≈ 2700 ASCII-code tokens + query +
+    /// special tokens). The server's physical batch must fit it too; if a
+    /// batch is still rejected as too large, the client halves the limit
+    /// and retries (see `reranker::Client::rerank`).
     #[serde(default = "default_reranker_max_doc_chars")]
     pub max_document_chars: usize,
 }

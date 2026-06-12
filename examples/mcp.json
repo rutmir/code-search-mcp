@@ -2,7 +2,7 @@
   "_comment": "Copy this file to <project>/.mcp.json (at the project root, NOT inside .claude/). Replace the absolute path to the built binary. Project-scoped MCP servers require explicit approval in `claude` the first time — run `claude` interactively and accept the workspace trust + server approval prompt; then `claude mcp list` shows the server. Claude Code spawns this process at session start and tears it down at exit. The server reads JSON-RPC from stdin and writes responses to stdout; all logs go to stderr (which Claude Code captures for diagnostics).",
   "mcpServers": {
     "code-search": {
-      "command": "/home/user/repo/roex/agentic/code-search-mcp/target/release/code-search-mcp",
+      "command": "/abs/path/to/code-search-mcp/target/release/code-search-mcp",
       "args": ["--config", ".claude/code-search.toml", "serve"],
       "env": {
         "RUST_LOG": "code_search_mcp=info,tantivy=warn,warn"

@@ -81,7 +81,7 @@ impl Bm25Index {
         Ok(())
     }
 
-    /// Currently unused — kept for the Stage 3 search-time chunk-id
+    /// Currently unused — kept for a future search-time chunk-id
     /// invalidation path (when we know specific stale chunk IDs to drop
     /// without redoing a `delete_by_file`). Remove once that lands or if
     /// we settle on `delete_by_file` as the only deletion primitive.
@@ -157,7 +157,7 @@ fn build_schema() -> (Schema, SchemaFields) {
     )
 }
 
-// Suppress dead-code warnings for the index/fields that the searcher (Stage 3) will use.
+// Suppress dead-code warnings for index/field accessors used only by `Bm25Search`.
 #[allow(dead_code)]
 impl Bm25Index {
     pub fn index(&self) -> &Index {

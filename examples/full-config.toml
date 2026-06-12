@@ -89,14 +89,17 @@ enabled = true
 # the dynamic timeout (proportional to batch size at observed throughput)
 # almost always fires first. Default 120 is plenty on top of the dynamic.
 # timeout_secs = 120
-# Truncate each candidate document to this many BYTES before sending.
+# Truncate each candidate document to this many chars before sending.
 # Defaults to 8000 — sized so the cross-encoder sees full function bodies
 # (most Rust functions ≤ 250 lines ≈ 7000 chars) within bge-reranker-v2-m3's
-# native ctx=8192 plus headroom for query + special tokens.
+# native ctx=8192 plus headroom for query + special tokens. Make sure the
+# server's physical batch fits it too: llama.cpp needs `-b`/`-ub` ≥ your
+# longest truncated doc in TOKENS (chars-per-token varies ~2× by language;
+# see the README's reference compose). If the server still rejects a batch
+# as too large, the client halves the truncation and retries (up to 2×,
+# floor 512 chars) before falling back to RRF-only ranking.
 # This is the QUALITY-first setting. Drop to ~4000 if you need ~2× faster
-# rerank latency at some loss of rank quality on long functions. Drop to
-# ~2000 if your reranker is stuck at legacy ctx=1024 (the system falls
-# back to RRF-only ranking automatically on context-overflow errors).
+# rerank latency at some loss of rank quality on long functions.
 # max_document_chars = 8000
 
 [watcher]
@@ -122,6 +125,11 @@ debounce_ms = 500
 # sparse_k = 30       # candidates from tantivy BM25.
 # rerank_top_n = 30   # top-N by RRF go to cross-encoder; tail keeps RRF score.
 # rrf_k = 60          # Reciprocal Rank Fusion constant; smaller favors top of list.
+# rerank_weight = 2.0 # reranker's rank-vote weight in the final fusion, relative
+#                     # to one retrieval modality (dense / sparse count as 1 each).
+#                     # 2.0 = strong vote, not a veto: a candidate both retrieval
+#                     # sides rank highly survives a single cross-encoder miss.
+#                     # 0.0 = rank purely by RRF (rerank scores still reported).
 
 [chunking]
 # Available strategies:

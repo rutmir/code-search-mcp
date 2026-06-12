@@ -2,6 +2,29 @@
 
 History of significant changes. Newest at the top. Dates are when work landed locally; this project doesn't tag releases yet.
 
+## 2026-06-12 — v0.0.2
+
+### Reranker resilience: halve-and-retry on "too large", visible RRF fallback
+
+Two fixes for the silent-degradation mode found in production: a reranker server with a physical batch (`-ub`) smaller than `max_document_chars`-worth of tokens rejected every batch with HTTP 500 "input is too large to process", and every search quietly fell back to RRF-only ranking — visible only in server stderr, which Claude Code does not persist past connection start.
+
+- **Halve-and-retry**: when the server rejects a batch as too large (physical batch / context overflow diagnostics matched in the error body), the truncation limit is halved and the call retried, up to 2 times with a 512-char floor. A degraded rerank over shortened documents beats losing the cross-encoder entirely. Token-per-char ratios vary ~2× between ASCII code and Cyrillic prose, so a static char limit can't be exactly right for every batch — the retry absorbs that.
+- **Visible fallback**: when a reranker is configured but no returned hit carries a rerank score, the MCP tool response now leads with `WARNING: reranker unavailable — results are RRF-ranked only`. The degradation is visible to the calling LLM and in the transcript, not just in lost stderr. No warning when the reranker is intentionally disabled.
+
+### `check` probes the reranker with a contrastive pair
+
+`check` previously verified embeddings + Qdrant and only warn-logged that the reranker is not probed. It now sends a two-document contrastive probe (on-topic vs off-topic) and verifies the on-topic document scores higher — catching not just dead servers but the "loads cleanly, outputs garbage scores" failure mode of broken classifier heads (see jina-v3-under-llama.cpp history).
+
+### Rerank fused into RRF as a rank-vote instead of replacing the final score
+
+Previously, with rerank on, the final ranking was the cross-encoder's score alone — the dense+sparse RRF consensus was discarded. Observed failure mode on a real corpus (moex-trader): for "adaptive position sizing risk per trade", bge-reranker-v2-m3 ranked a data-pull bash script above `build_si_portfolio` (the actual fixed-fractional sizing code) that both retrieval modalities had at #1–2. A general-purpose multilingual cross-encoder is keyword-prose-biased on code; giving it veto power lets one model error sink a retrieval-consensus candidate.
+
+Now the reranker contributes a third rank-vote on the same RRF scale: `final = rrf + rerank_weight / (rrf_k + rerank_rank + 1)`. Rank-based fusion, not score blending — reranker logits (−10..+10) and RRF scores (0.01–0.05) live on incomparable scales, the same argument that picked RRF over score-weighting for dense+sparse originally.
+
+New `[search].rerank_weight` knob (default 2.0): the cross-encoder counts as two retrieval modalities — a strong vote, not a veto. `0.0` = rank purely by RRF while still reporting per-hit rerank scores. Head/tail ordering stays consistent: fused head scores ≥ their RRF ≥ any tail RRF.
+
+Diagnostic change: final scores are now always on the RRF scale (~0.01–0.09). "Reranker fell back" is no longer detectable by score magnitude — look for missing `rerank=` component on hits instead (README troubleshooting updated).
+
 ## 2026-06-11 (docs fix)
 
 ### `examples/CLAUDE.md` template — push project-level instruction above auto-memory

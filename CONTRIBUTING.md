@@ -11,7 +11,7 @@ Single-binary Rust project, ~6 kLoC. The interesting bits:
 - `src/chunker.rs` — `LineChunker`, `HeadingsChunker`, `TreeSitterChunker` (one per language); `ChunkerSet` dispatches per-language
 - `src/embedding.rs`, `src/reranker.rs`, `src/vector_store.rs` — HTTP clients with retries / throughput-aware timeouts / marker safety
 - `src/bm25.rs` — tantivy index and read-only `Bm25Search`
-- `src/search.rs` — hybrid retrieval pipeline: embed query → dense+sparse → RRF merge → optional rerank
+- `src/search.rs` — hybrid retrieval pipeline: embed query → dense+sparse → RRF merge → optional rerank, fused into the RRF as a weighted rank-vote
 - `src/serve.rs` — MCP stdio JSON-RPC loop, `tools/call` cancellation, watcher integration
 - `src/watcher.rs` — `notify`-debounced incremental reindex
 - `src/walker.rs` — file enumeration + `PathFilter` (gitignore/exclude/extensions)

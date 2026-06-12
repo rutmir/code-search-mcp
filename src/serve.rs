@@ -5,18 +5,17 @@
 //! from stdin, writes responses to stdout, and ALL logging goes to stderr.
 //! Writing anything else to stdout silently breaks the client.
 //!
-//! Scope (Stage 3 minimal):
+//! Scope:
 //!   - `initialize` / `notifications/initialized` handshake
 //!   - `tools/list` advertising the `code_search` tool
-//!   - `tools/call` dispatching to [`crate::search::run`]
+//!   - `tools/call` dispatching to [`crate::search::run`]; each call runs
+//!     in its own spawned task, tracked by request id
+//!   - `notifications/cancelled` — preempts the matching in-flight search
+//!     via a oneshot raced in `tokio::select!`
 //!   - `ping` as a health-check
-//!   - Sequential request handling — one tool call at a time. Concurrent
-//!     calls queue at the read side. Justified because the embedding /
-//!     reranker servers are typically single-slot anyway, so spawning
-//!     wouldn't unblock anything.
+//!   - background watcher task (when `[watcher].enabled`)
 //!
 //! Out of scope (deferred):
-//!   - `notifications/cancelled` (would need to abort in-flight searches)
 //!   - resources, prompts, logging notifications
 //!   - tools/list_changed notifications
 //!   - structured `outputSchema` on tool results
@@ -477,10 +476,11 @@ async fn handle_tools_call(config: &Config, msg: &Value) -> Result<Value, (i32, 
                 results = results.len(),
                 elapsed_ms, "tools/call code_search completed"
             );
+            let rerank_expected = config.reranker.as_ref().is_some_and(|r| r.enabled);
             Ok(json!({
                 "content": [{
                     "type": "text",
-                    "text": format_results_for_llm(&results, query, elapsed_ms)
+                    "text": format_results_for_llm(&results, query, elapsed_ms, rerank_expected)
                 }],
                 "isError": false
             }))
@@ -509,6 +509,7 @@ fn format_results_for_llm(
     results: &[search::SearchResult],
     query: &str,
     elapsed_ms: u64,
+    rerank_expected: bool,
 ) -> String {
     let mut s = String::new();
     let _ = writeln!(
@@ -521,6 +522,20 @@ fn format_results_for_llm(
     if results.is_empty() {
         let _ = writeln!(s, "(no matches — try a different query or remove filters)");
         return s;
+    }
+    // Rerank runs unconditionally in serve mode whenever a reranker is
+    // configured, so a result set where no hit carries a rerank score
+    // means the cross-encoder call failed and search fell back to
+    // retrieval-only RRF ranking. Surface that to the LLM (and the human
+    // reading the transcript) instead of degrading silently — the
+    // ordering is noticeably weaker without the reranker. No warning when
+    // the reranker is intentionally disabled in config.
+    if rerank_expected && results.iter().all(|r| r.rerank_score.is_none()) {
+        let _ = writeln!(
+            s,
+            "WARNING: reranker unavailable — results are RRF-ranked only (lower precision). \
+             Treat the ordering as approximate."
+        );
     }
     for (i, r) in results.iter().enumerate() {
         let _ = writeln!(s);
@@ -641,13 +656,12 @@ mod tests {
 
     #[test]
     fn format_results_empty() {
-        let s = format_results_for_llm(&[], "x", 5);
+        let s = format_results_for_llm(&[], "x", 5, true);
         assert!(s.contains("no matches"));
     }
 
-    #[test]
-    fn format_results_renders_each_hit() {
-        let results = vec![search::SearchResult {
+    fn sample_result(rerank_score: Option<f32>) -> search::SearchResult {
+        search::SearchResult {
             file: "src/foo.rs".to_string(),
             start_line: 10,
             end_line: 20,
@@ -655,16 +669,39 @@ mod tests {
             score: 0.91,
             dense_score: Some(0.8),
             sparse_score: Some(12.5),
-            rerank_score: Some(0.91),
+            rerank_score,
             preview: "fn   bar() { do_thing()   }".to_string(),
             kind: Some("fn".to_string()),
             name: Some("bar".to_string()),
-        }];
-        let s = format_results_for_llm(&results, "q", 5);
+        }
+    }
+
+    #[test]
+    fn format_results_renders_each_hit() {
+        let s = format_results_for_llm(&[sample_result(Some(0.91))], "q", 5, true);
         assert!(s.contains("src/foo.rs:10-20"));
         assert!(s.contains("rust"));
         assert!(s.contains("0.9100"));
         // Whitespace runs collapsed in preview.
         assert!(s.contains("fn bar() { do_thing() }"));
+        // Reranker delivered — no degradation warning.
+        assert!(!s.contains("WARNING"));
+    }
+
+    #[test]
+    fn format_results_warns_on_rerank_fallback() {
+        // Reranker expected but no hit carries a rerank score → the RRF
+        // fallback fired; the LLM must see that the ordering is degraded.
+        let s = format_results_for_llm(&[sample_result(None)], "q", 5, true);
+        assert!(s.contains("WARNING"));
+        assert!(s.contains("RRF"));
+    }
+
+    #[test]
+    fn format_results_no_warning_when_rerank_disabled() {
+        // Reranker intentionally disabled in config — RRF-only is the
+        // expected mode, not a degradation.
+        let s = format_results_for_llm(&[sample_result(None)], "q", 5, false);
+        assert!(!s.contains("WARNING"));
     }
 }

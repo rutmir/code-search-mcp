@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use crate::config::RerankerConfig;
 
-/// HTTP client to a Jina-style `/v1/rerank` endpoint (bge-reranker-v2-m3
-/// / jina-reranker-v2 as served by llama.cpp with `--reranking`).
+/// HTTP client to a Jina-style `/v1/rerank` endpoint (e.g.
+/// bge-reranker-v2-m3 as served by llama.cpp with `--reranking`).
 ///
 /// Per-request timeout is throughput-aware: the client tracks an EWMA of
 /// observed `chars / sec` across successful rerank calls and derives the
@@ -40,6 +40,25 @@ const TIMEOUT_FLOOR_SECS: f64 = 30.0;
 /// Per-request timeout ceiling. Beyond this the server is almost certainly
 /// stuck (real hang, crash); the fallback-to-RRF path is the right response.
 const TIMEOUT_CEILING_SECS: f64 = 1200.0;
+
+/// How many "batch too large" rejections trigger a halve-and-retry before
+/// giving up. Two halvings take the default 8000-char budget down to 2000 —
+/// under any physical batch limit a working server could plausibly have.
+const MAX_TOO_LARGE_RETRIES: u32 = 2;
+/// Never truncate below this. Documents this short are barely rankable;
+/// if the server still rejects them, it's misconfigured and the caller's
+/// RRF fallback is the right answer.
+const TRUNCATION_FLOOR_CHARS: usize = 512;
+
+/// Does this error look like the server rejecting the request for size
+/// (physical batch / context overflow) rather than being down or slow?
+/// Matched against llama.cpp's diagnostics ("input (N tokens) is too large
+/// to process...", "...exceeds the available context size") — retrying
+/// with harder truncation only makes sense for these.
+fn is_too_large_error(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}").to_lowercase();
+    msg.contains("too large") || msg.contains("context size") || msg.contains("exceeds")
+}
 
 #[derive(Serialize)]
 struct RerankRequest<'a> {
@@ -116,28 +135,61 @@ impl Client {
     /// sorted by score with `index` references; we re-arrange here so the
     /// caller can pair scores with metadata it kept alongside the docs).
     ///
-    /// Documents are truncated to `max_document_chars` *bytes* before being
-    /// sent — cross-encoder rerankers commonly have small (1-8K token)
-    /// context windows, and a single oversized doc causes the whole rerank
-    /// request to 400 with "input is larger than the max context size".
-    /// Truncation is done by chars to keep the boundary on a valid UTF-8
-    /// codepoint.
+    /// Documents are truncated to `max_document_chars` before being sent —
+    /// cross-encoder rerankers commonly have small (1-8K token) context
+    /// windows, and a single oversized doc causes the whole rerank request
+    /// to fail with "input is too large". If the server still rejects the
+    /// batch as too large (chars→tokens ratio varies by language; Cyrillic
+    /// markdown packs ~2× more tokens per char than ASCII code), the
+    /// truncation limit is halved and the call retried — a degraded rerank
+    /// over shortened documents beats losing the cross-encoder entirely.
     pub async fn rerank(&self, query: &str, documents: Vec<String>) -> Result<Vec<f32>> {
         if documents.is_empty() {
             return Ok(Vec::new());
         }
+        let mut limit = self.max_document_chars;
+        let mut retries = 0u32;
+        loop {
+            match self.rerank_attempt(query, &documents, limit).await {
+                Ok(scores) => return Ok(scores),
+                Err(e)
+                    if retries < MAX_TOO_LARGE_RETRIES
+                        && limit / 2 >= TRUNCATION_FLOOR_CHARS
+                        && is_too_large_error(&e) =>
+                {
+                    limit /= 2;
+                    retries += 1;
+                    tracing::warn!(
+                        new_limit = limit,
+                        retry = retries,
+                        error = %e,
+                        "reranker rejected batch as too large; halving truncation and retrying"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// One rerank round-trip with documents truncated to `limit` chars.
+    async fn rerank_attempt(
+        &self,
+        query: &str,
+        documents: &[String],
+        limit: usize,
+    ) -> Result<Vec<f32>> {
         let n = documents.len();
         let mut truncated_count = 0usize;
         let prepared: Vec<String> = documents
-            .into_iter()
+            .iter()
             .map(|d| {
-                if d.len() > self.max_document_chars {
+                if d.len() > limit {
                     truncated_count += 1;
                     // chars().take() avoids cutting in the middle of a
                     // multi-byte codepoint; cheap relative to network RTT.
-                    d.chars().take(self.max_document_chars).collect()
+                    d.chars().take(limit).collect()
                 } else {
-                    d
+                    d.clone()
                 }
             })
             .collect();
@@ -145,7 +197,7 @@ impl Client {
             tracing::debug!(
                 count = truncated_count,
                 total = n,
-                limit = self.max_document_chars,
+                limit,
                 "truncated documents to fit reranker context"
             );
         }

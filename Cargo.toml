@@ -1,8 +1,8 @@
 [package]
 name = "code-search-mcp"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
-description = "MCP server for hybrid code retrieval (BM25 + dense + LSP). A/B candidate vs Claude Code Explore agent."
+description = "Token-saving MCP server for hybrid code search: tree-sitter chunking + BM25 + dense embeddings + cross-encoder rerank"
 license = "MIT OR Apache-2.0"
 publish = false
 

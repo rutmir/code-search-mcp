@@ -7,9 +7,8 @@ use std::time::Duration;
 
 use crate::config::{Config, ProjectConfig, VectorStoreConfig};
 
-/// Qdrant REST client.
-/// Stage 1: ping, ensure_collection, upsert_points, delete_points.
-/// Stage 3 will add: search_points (vector search).
+/// Qdrant REST client: ping, ensure_collection, upsert/delete points,
+/// vector search, and the project-identity marker handling.
 pub struct Client {
     http: HttpClient,
     base_url: String,
@@ -326,7 +325,7 @@ impl Client {
         send_with_retry("qdrant upsert_points", || self.http.put(&url).json(&body)).await
     }
 
-    /// Currently unused — kept for the Stage 3 chunk-level invalidation
+    /// Currently unused — kept for a future chunk-level invalidation
     /// path (drop specific chunk IDs without doing a `delete_by_file`).
     /// Remove once that lands or `delete_by_file` settles as the only
     /// deletion primitive.

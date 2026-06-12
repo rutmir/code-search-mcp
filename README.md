@@ -29,19 +29,21 @@ Once wired up, your Claude Code session gets a single tool:
   "query": "AIMD adaptive batching halving on failure",
   "limit": 5,        // optional, default 10
   "lang": "rust",    // optional, restrict to one language
-  "path": "crates/"  // optional, restrict to a path prefix
+  "path": "crates/"  // optional, only hits whose path contains this substring
 }
 ```
 
 Output (each hit carries `file:start-end`, language, syntactic kind+name, score, preview):
 
 ```
-#1 crates/bot/src/execution/cross_pressure.rs:69-91  [rust]  struct CrossPressureDetector  score=1.6960
+#1 crates/bot/src/execution/cross_pressure.rs:69-91  [rust]  struct CrossPressureDetector  score=0.0655
     pub struct CrossPressureDetector { /// Diagnostic only ... future_feed: Arc<L2Feed>, ...
 
-#2 crates/bot/src/execution/cross_pressure.rs:390-399  [rust]  fn observe_tick_returns_verdicts  score=0.8847
+#2 crates/bot/src/execution/cross_pressure.rs:390-399  [rust]  fn observe_tick_returns_verdicts  score=0.0512
     fn observe_tick_returns_verdicts() { let fut = L2Feed::new(); ...
 ```
+
+(The CLI `search` command additionally prints per-component `dense=` / `bm25=` / `rerank=` scores for debugging; the MCP response keeps them out to save tokens.)
 
 ## How it works
 
@@ -72,14 +74,15 @@ Output (each hit carries `file:start-end`, language, syntactic kind+name, score,
                 ┌──────────────────────┐
                 │  RRF merge           │
                 │  + top-N rerank      │
-                │  (jina / bge-v2-m3)  │
+                │  (bge-reranker-v2-m3)│
+                │  fused as rank-vote  │
                 └──────────────────────┘
                            │
                            ▼
                     ranked results
 ```
 
-The indexer is incremental (sha-cached), the watcher tracks live edits, and the search is **two-stage** (RRF over a 30+30 candidate pool, cross-encoder over the top 30) so reranker cost is bounded regardless of corpus size.
+The indexer is incremental (sha-cached), the watcher tracks live edits, and the search is **two-stage** (RRF over a 30+30 candidate pool, cross-encoder over the top 30) so reranker cost is bounded regardless of corpus size. The cross-encoder's opinion is fused into the dense+sparse RRF as a weighted rank-vote rather than replacing the score — one reranker miss can't sink a candidate both retrieval modalities agree on (see `[search].rerank_weight`).
 
 ## Requirements
 
@@ -121,7 +124,7 @@ services:
       ["-m", "/models/bge/bge-reranker-v2-m3-q8_0.gguf",
        "--reranking",
        "--port", "7799", "--host", "0.0.0.0",
-       "-c", "8192", "-ub", "2048",
+       "-c", "8192", "-b", "8192", "-ub", "4096",
        "--parallel", "1", "--threads", "4",
        "--no-webui"]
     restart: always
@@ -129,6 +132,8 @@ services:
 ```
 
 The `--pooling last` on the embedding server is **non-optional** for jina-code-embeddings-0.5b (it's a Qwen3-decoder model; `cls`/`mean` pooling produces semantically broken vectors). `--parallel 1` on the reranker is the right choice for memory-bandwidth-bound CPUs.
+
+On the reranker, a cross-encoder processes each query+document pair in one pass, so the physical batch (`-ub`) must fit your longest truncated document — and llama.cpp silently clamps `-ub` to `-b`, so **set both**. `-b 8192 -ub 4096` comfortably fits the default `max_document_chars = 8000` (≈2000–4000 tokens depending on language). If a document still overflows, the client halves its truncation and retries automatically, at some quality cost.
 
 ## Install
 
@@ -224,13 +229,14 @@ Pick the ones you actually have and add them to `[index].languages`.
 ./target/release/code-search-mcp --config .claude/code-search.toml check
 ```
 
-This pings the embedding endpoint, verifies the model's dimensions match the config, pings Qdrant, and (if there's an existing index) verifies the project-identity marker.
+This pings the embedding endpoint, verifies the model's dimensions match the config, pings Qdrant, (if there's an existing index) verifies the project-identity marker, and probes the reranker with a contrastive document pair — a healthy cross-encoder must score an on-topic document above an off-topic one, which catches the "server is up but the model outputs garbage scores" failure mode.
 
 Expected output:
 
 ```
 INFO embedding endpoint OK model=jina-code-embeddings-0.5b dimensions=896
 INFO qdrant collection does not exist yet — will be created on first `index`
+INFO reranker endpoint OK model=bge-reranker-v2-m3 on_topic=2.31 off_topic=-8.7
 INFO all checks passed
 ```
 
@@ -253,14 +259,14 @@ The first run does a full scan + embed. Subsequent runs only process changed fil
 query: adaptive batching halving on failure
 results: 5 (18207 ms)
 
-#1  src/adaptive_batcher.rs:42-89  [rust]  fn AdaptiveBatcher::note_failure  score=1.5821
+#1  src/adaptive_batcher.rs:42-89  [rust]  fn AdaptiveBatcher::note_failure  score=0.0648  dense=0.531  bm25=14.207  rerank=1.582
     pub fn note_failure(&mut self) { self.consecutive_ok = 0; ...
 
-#2  src/indexer.rs:445-510  [rust]  fn embed_with_adaptive_batching  score=0.6112
+#2  src/indexer.rs:445-510  [rust]  fn embed_with_adaptive_batching  score=0.0489  dense=0.502  rerank=0.611
     ...
 ```
 
-If you see RRF-scored results in the 0.01–0.05 range instead, the reranker failed and search fell back to RRF — check the reranker server.
+Each hit carries its component scores: `dense=` / `bm25=` / `rerank=`. If `rerank=` is missing on every hit, the reranker failed and search fell back to RRF-only ranking — check the reranker server.
 
 ## Wire to Claude Code
 
@@ -315,6 +321,7 @@ The minimal config above is enough for most setups. Optional knobs you may want 
 **`[search]`** (all fields optional)
 - `dense_k`, `sparse_k`, `rerank_top_n` (all default 30) — top-K from each modality + rerank ceiling. Drop to 15–20 for ~30–40% faster searches at recall cost
 - `rrf_k` (default 60) — Reciprocal Rank Fusion constant per Cormack et al.
+- `rerank_weight` (default 2.0) — the reranker's rank-vote weight in the final fusion, relative to one retrieval modality. The cross-encoder's opinion is fused into the dense+sparse RRF as a third rank-vote rather than replacing the score outright, so a candidate both retrieval sides agree on survives a single reranker miss. `0.0` ranks purely by RRF (rerank scores still reported per-hit)
 
 **`[chunking]`** and **`[chunking.per_language.<lang>]`**
 - Changes to chunking parameters (strategy, max_chunk_lines, overlap_lines, max_chunk_chars, per-language overrides) trigger an **auto-clear + rebuild** on the next `index` because chunk identity changes. This is the right behavior, just be aware of it
@@ -354,8 +361,11 @@ One MCP server process per Claude Code session. Each project's `.mcp.json` (at t
 **`embedding endpoint returned HTTP 500: ... input too large to process`**
 The adaptive batcher will halve the budget automatically and retry. If you see many of these in a row, your `--ubatch-size` on the embedding server may be too small for typical chunks; either raise it or lower `chunking.max_chunk_chars`.
 
-**`reranker failed; falling back to RRF-only ranking`**
-The reranker server is unhealthy, slow, or has a smaller ctx than your `max_document_chars`. Drop `[reranker].max_document_chars` to 4000–6000, or check the reranker container logs. Search still returns useful results via RRF.
+**`reranker rejected batch as too large; halving truncation and retrying`**
+A document exceeded the reranker server's physical batch (`-ub`) or context. The client automatically halves its truncation limit and retries (up to 2 times), so the search still gets reranked — over shortened documents. If this happens on most queries, raise `-b`/`-ub` on the reranker server (note: llama.cpp clamps `-ub` to `-b`, so set both) or lower `[reranker].max_document_chars`.
+
+**`reranker failed; falling back to RRF-only ranking`** (and `WARNING: reranker unavailable` in tool output)
+The reranker server is down, slow, or persistently rejecting requests. Check the reranker container logs; `check` now probes the reranker and reports whether it scores sanely. Search still returns useful results via RRF, and the MCP tool response is marked with a degradation warning so the calling LLM knows the ordering is approximate.
 
 **`Qdrant collection '...' fingerprint mismatch`**
 Your `vector_store.collection` points at someone else's collection (different project_id or root path). Either fix the config, rename the collection, or `clear --yes` to wipe and start fresh.

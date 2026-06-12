@@ -61,8 +61,9 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Run as an MCP server over stdio (Stage 3). Exposes a single tool
-    /// `code_search`. Used by Claude Code via .claude/mcp.json.
+    /// Run as an MCP server over stdio. Exposes a single tool
+    /// `code_search`. Used by Claude Code via `.mcp.json` at the
+    /// project root.
     Serve,
     /// Watch the project tree and incrementally reindex on file changes.
     /// First does a full sync via `index` (cheap if no files changed
@@ -344,12 +345,46 @@ async fn run_check(config: &Config) -> Result<()> {
         );
     }
 
-    if let Some(reranker) = &config.reranker {
-        if reranker.enabled {
-            warn!(
-                url = %reranker.url,
-                "reranker configured but Stage 0 does not probe it (Stage 3 task)"
-            );
+    if let Some(reranker_cfg) = &config.reranker {
+        if reranker_cfg.enabled {
+            info!("checking reranker endpoint");
+            let rer = reranker::Client::new(reranker_cfg);
+            // Tiny contrastive probe: a healthy cross-encoder must score the
+            // on-topic document above the off-topic one. Catches not just
+            // dead servers but the "loads cleanly, outputs garbage scores"
+            // failure mode of broken classifier heads.
+            let scores = rer
+                .rerank(
+                    "apple fruit",
+                    vec![
+                        "An apple is an edible fruit produced by an apple tree.".to_string(),
+                        "The mutex guards the scheduler queue against data races.".to_string(),
+                    ],
+                )
+                .await
+                .context("reranker probe")?;
+            if scores.len() != 2 {
+                anyhow::bail!(
+                    "reranker probe returned {} scores for 2 documents",
+                    scores.len()
+                );
+            }
+            if scores[0] <= scores[1] {
+                warn!(
+                    on_topic = scores[0],
+                    off_topic = scores[1],
+                    "reranker scored an off-topic document above an on-topic one — \
+                     model or server is likely misconfigured (wrong pooling, broken \
+                     classifier head, wrong model file)"
+                );
+            } else {
+                info!(
+                    model = %reranker_cfg.model,
+                    on_topic = scores[0],
+                    off_topic = scores[1],
+                    "reranker endpoint OK"
+                );
+            }
         }
     }
 
@@ -358,7 +393,7 @@ async fn run_check(config: &Config) -> Result<()> {
 }
 
 /// Tracing setup: everything goes to stderr.
-/// stdout is reserved for MCP JSON-RPC framing once `serve` is implemented (Stage 3).
+/// stdout is reserved for MCP JSON-RPC framing in `serve` mode.
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     fmt()
