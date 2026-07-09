@@ -155,7 +155,11 @@ id = "myproject"
 root = "."
 
 [index]
-languages = ["rust", "toml", "markdown"]   # add any of: python, cpp, dart, typescript, javascript, go, csharp, java, shell, systemd, env, text, yaml, json
+# `languages` is OPTIONAL. Omit it to index everything that isn't a known
+# binary or >2 MB (zero-config, nothing silently dropped). Set it only to
+# NARROW a noisy repo to a whitelist — any of: rust, python, cpp, dart,
+# typescript, javascript, go, csharp, java, xml, gradle, properties, shell,
+# systemd, env, text, yaml, json, markdown, toml.
 respect_gitignore = true
 exclude = ["target/**", "build/**", "**/*.lock"]
 

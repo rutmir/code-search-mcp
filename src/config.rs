@@ -72,6 +72,12 @@ pub struct ProjectConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct IndexConfig {
+    /// Languages to index. **Optional.** When omitted or empty, the walker
+    /// indexes every file that isn't a known-binary type or oversize (see
+    /// `walker::index_all_default`) — zero-config for a new project. When
+    /// non-empty, it acts as an explicit whitelist (only those languages'
+    /// extensions are walked), which is the way to *narrow* a noisy repo.
+    #[serde(default)]
     pub languages: Vec<String>,
     #[serde(default = "default_true")]
     pub respect_gitignore: bool,

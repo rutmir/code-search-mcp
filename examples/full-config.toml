@@ -10,11 +10,27 @@ id = "myproject"
 root = "."
 
 [index]
-# Add any of the following to enable that language's files:
+# OPTIONAL. Omit `languages` entirely (or set `[]`) and the indexer walks
+# EVERYTHING except known-binary files (images, archives, native objects,
+# .spv/.jar/.class, ML weights, …) and files over ~2 MB — zero-config, and it
+# won't silently drop a file type you didn't think to list (e.g. an Android
+# manifest). Files whose extension has no AST grammar are line-chunked; known
+# code/doc languages still get their tree-sitter / heading chunker.
+#
+# Set `languages` only to NARROW a noisy repo to a specific set. When set, it is
+# a strict whitelist (and the 2 MB size cap does not apply — you named those
+# types on purpose). Available buckets:
+#
+# Add any of the following to restrict to that language's files:
 #   tree-sitter (AST-aware):  "rust" "python" "cpp" "dart" "typescript"
 #                             "javascript" "go" "csharp" "java"
-#   structured-text:          "markdown" "toml" "yaml" "json"
+#   structured-text:          "markdown" "toml" "yaml" "json" "xml"
+#   build / manifest config:  "gradle" "properties"   (Android/JVM projects)
 #   plain-text bucket:        "shell" "systemd" "env" "text"
+# `xml` covers AndroidManifest.xml + res/values/*.xml; `gradle` covers
+# build.gradle / settings.gradle; `properties` covers gradle*.properties.
+# All three are line-chunked (no tree-sitter) — good enough for the small,
+# flat config files they target.
 # `text` is a catch-all for *.txt / *.local / *.example / *.ini / *.cfg /
 # *.conf — useful for sample-config files, INI/CFG configs, and notes.
 languages = ["rust", "toml", "markdown"]

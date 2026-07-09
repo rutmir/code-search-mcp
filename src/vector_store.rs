@@ -33,7 +33,7 @@ pub fn config_hard_fingerprint(config: &Config) -> String {
     h.update(config.chunking.max_chunk_chars.to_le_bytes());
     // Sort per_language for determinism — HashMap iteration order varies.
     let mut langs: Vec<_> = config.chunking.per_language.iter().collect();
-    langs.sort_by(|(a, _), (b, _)| a.cmp(b));
+    langs.sort_by_key(|(a, _)| *a);
     h.update(b"\0per_language\0");
     for (lang, lc) in langs {
         h.update(lang.as_bytes());

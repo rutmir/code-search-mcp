@@ -2,6 +2,54 @@
 
 History of significant changes. Newest at the top. Dates are when work landed locally; this project doesn't tag releases yet.
 
+## 2026-07-08
+
+### `[index].languages` is now optional — opt-out indexing by default
+
+Flipped the walk model from **deny-unless-listed** to
+**allow-unless-binary**. `[index].languages` used to be required, and any
+extension not covered by a listed language was silently dropped — you only
+found out a file type was missing (an Android manifest, a `.gradle`, a shader
+config) by noticing search couldn't find it. That's a bad failure mode for a
+quality-first tool.
+
+Now:
+
+- **Omit `languages` (or `[]`)** → the indexer walks *everything* except
+  known-binary extensions and files over 2 MB (`walker::ExtPolicy::AllButBinary`).
+  Zero-config: a new project just works, and no text type is silently dropped.
+- **Set `languages`** → unchanged behavior: a strict whitelist to *narrow* a
+  noisy repo (size cap doesn't apply — you named those types).
+
+Binary safety is layered, not extension-guesswork:
+- A built-in binary-extension deny-set (`BINARY_EXTENSIONS`: images, archives,
+  native objects, `.spv`/`.jar`/`.class`/`.dex`, fonts, ML weights, …) is the
+  fast pre-filter so large binaries aren't read just to be rejected.
+- A 2 MB size cap skips generated/minified/bundled blobs without reading them.
+- The indexer's read now sniffs content (`read_text_file`: NUL byte or invalid
+  UTF-8 → `Ok(None)`) and skips binaries **quietly at debug**, catching
+  anything the deny-set misses (extensionless executables, exotic types)
+  without log spam.
+
+Backward compatible: existing configs with an explicit `languages` list behave
+exactly as before (same file set, same `config_soft` fingerprint). The new
+default only affects configs that omit the field. Switching an existing config
+to the default (removing `languages`) is a `config_soft` change → the marker
+flow reindexes with stale cleanup on next `index` / `serve`.
+
+### Android / JVM config buckets (`xml`, `gradle`, `properties`)
+
+Also added three plain-text language buckets so an explicit whitelist can name
+the mobile/AR config surface: `xml` (`AndroidManifest.xml`, `res/values/*.xml`,
+layouts/menus), `gradle` (`build.gradle` / `settings.gradle`), `properties`
+(`gradle.properties`). Line-chunked (no tree-sitter), like `toml`/`yaml`/`json`.
+(With the opt-out default above these are indexed automatically anyway; the
+buckets matter when you *narrow* via `languages`.)
+
+Housekeeping: cleared two pre-existing clippy lints newer stable (1.96) began
+flagging (`unnecessary_sort_by` in `vector_store.rs`, redundant `.into_iter()`
+in `indexer.rs`) so `clippy -D warnings` is green again.
+
 ## 2026-06-12 — v0.0.3
 
 **⚠ Upgrade note: the first `index` / `serve` start after this upgrade auto-clears and fully rebuilds the index** (BM25 schema revision bumped for the new tokenizer; re-embeds the whole corpus — plan for first-index duration).

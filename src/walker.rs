@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use ignore::{gitignore::Gitignore, overrides::OverrideBuilder, WalkBuilder};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::config::{IndexConfig, ProjectConfig};
@@ -39,7 +40,7 @@ pub fn walk(
         builder.overrides(overrides.build()?);
     }
 
-    let extensions = allowed_extensions(&index.languages);
+    let policy = ExtPolicy::from_languages(&index.languages);
     let root_for_filter = root.clone();
 
     let iter = builder.build().filter_map(move |result| {
@@ -51,14 +52,18 @@ pub fn walk(
             return None;
         }
         let path = entry.path();
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        if !extensions.iter().any(|e| e == &ext) {
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if !policy.admits(ext) {
             return None;
         }
+        // Size cap (all-but-binary default only) — skip oversize files without
+        // reading them. Metadata is cheap and only fetched once ext passes.
+        if let Ok(meta) = entry.metadata() {
+            if !policy.admits_size(meta.len()) {
+                return None;
+            }
+        }
+        let language = language_from_ext(ext);
         let relative = path
             .strip_prefix(&root_for_filter)
             .unwrap_or(path)
@@ -66,18 +71,90 @@ pub fn walk(
         Some(Ok(FileEntry {
             absolute: path.to_path_buf(),
             relative,
-            language: language_from_ext(&ext),
+            language,
         }))
     });
 
     Ok(iter)
 }
 
-fn allowed_extensions(languages: &[String]) -> Vec<String> {
-    languages
-        .iter()
-        .flat_map(|l| extensions_for_language(l).iter().map(|s| s.to_string()))
-        .collect()
+/// Files larger than this are skipped by the all-but-binary default without
+/// being read — they're almost always generated (minified bundles, lockfiles,
+/// embedded data) and would flood the index with low-value chunks. An explicit
+/// `[index].languages` whitelist bypasses the cap: you named those types on
+/// purpose.
+const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Extensions the all-but-binary default never tries to read as text. Fast
+/// pre-filter so large binaries aren't read + UTF-8-decoded just to be
+/// rejected; the indexer's NUL/UTF-8 sniff is the backstop for binaries not
+/// listed here (extensionless executables, exotic types). Matched
+/// case-insensitively.
+const BINARY_EXTENSIONS: &[&str] = &[
+    // images
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff", "tif", "svg", "psd", "heic",
+    // audio / video
+    "mp3", "wav", "flac", "ogg", "aac", "m4a", "mp4", "m4v", "mov", "avi", "mkv", "webm",
+    // archives / compressed
+    "zip", "jar", "war", "aar", "ear", "tar", "gz", "tgz", "bz2", "xz", "zst", "7z", "rar", "lz4",
+    // native binaries / objects
+    "so", "dylib", "dll", "a", "lib", "o", "obj", "class", "dex", "exe", "bin", "wasm", "node",
+    "pyc", "pyo", "pdb", "elf", "ko",
+    // mobile / gpu artifacts
+    "apk", "aab", "ipa", "spv", "nib", "car",
+    // fonts
+    "ttf", "otf", "woff", "woff2", "eot",
+    // documents / data blobs
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "sqlite", "db", "dat",
+    // ml weights / large arrays
+    "gguf", "safetensors", "onnx", "pt", "pth", "ckpt", "npy", "npz", "parquet",
+];
+
+fn is_binary_extension(ext: &str) -> bool {
+    let lower = ext.to_ascii_lowercase();
+    BINARY_EXTENSIONS.contains(&lower.as_str())
+}
+
+/// How the walker decides which files to admit, derived from
+/// `[index].languages`.
+enum ExtPolicy {
+    /// `languages` was set — admit only those languages' extensions (the way
+    /// to *narrow* a noisy repo). No size cap: you named these types.
+    Whitelist(HashSet<String>),
+    /// `languages` omitted/empty — admit everything except known-binary
+    /// extensions and oversize files. Zero-config default.
+    AllButBinary,
+}
+
+impl ExtPolicy {
+    fn from_languages(languages: &[String]) -> Self {
+        if languages.is_empty() {
+            ExtPolicy::AllButBinary
+        } else {
+            ExtPolicy::Whitelist(
+                languages
+                    .iter()
+                    .flat_map(|l| extensions_for_language(l).iter().map(|s| s.to_string()))
+                    .collect(),
+            )
+        }
+    }
+
+    fn admits(&self, ext: &str) -> bool {
+        match self {
+            ExtPolicy::Whitelist(exts) => exts.contains(ext),
+            ExtPolicy::AllButBinary => !is_binary_extension(ext),
+        }
+    }
+
+    /// Only the all-but-binary default caps file size; an explicit whitelist
+    /// indexes what it named regardless of size (preserves prior behavior).
+    fn admits_size(&self, len: u64) -> bool {
+        match self {
+            ExtPolicy::Whitelist(_) => true,
+            ExtPolicy::AllButBinary => len <= MAX_FILE_BYTES,
+        }
+    }
 }
 
 /// Stateless "should this path be indexed" check used by the watcher to
@@ -86,7 +163,8 @@ fn allowed_extensions(languages: &[String]) -> Vec<String> {
 ///
 /// Filters applied (in order):
 ///   1. Path must currently exist as a regular file
-///   2. Extension must match one of the configured languages
+///   2. Extension must satisfy the [`ExtPolicy`] (whitelist, or all-but-binary
+///      when `languages` is omitted) and the file must be within the size cap
 ///   3. If `respect_gitignore`, project-root `.gitignore` must not match
 ///   4. Excludes (`index.exclude`) must not match
 ///
@@ -95,7 +173,7 @@ fn allowed_extensions(languages: &[String]) -> Vec<String> {
 /// the typical layout where root .gitignore covers `target/`, `build/`,
 /// `node_modules/`, etc.
 pub struct PathFilter {
-    extensions: Vec<String>,
+    policy: ExtPolicy,
     gitignore: Option<Gitignore>,
     excludes: Option<ignore::overrides::Override>,
     root: PathBuf,
@@ -103,7 +181,7 @@ pub struct PathFilter {
 
 impl PathFilter {
     pub fn new(project: &ProjectConfig, index: &IndexConfig) -> Result<Self> {
-        let extensions = allowed_extensions(&index.languages);
+        let policy = ExtPolicy::from_languages(&index.languages);
 
         let gitignore = if index.respect_gitignore {
             // Collect every `.gitignore` in the project tree so nested ones
@@ -151,7 +229,7 @@ impl PathFilter {
         };
 
         Ok(Self {
-            extensions,
+            policy,
             gitignore,
             excludes,
             root: project.root.clone(),
@@ -167,9 +245,9 @@ impl PathFilter {
             return None;
         }
 
-        // 2. Extension must be in the allowed set.
+        // 2. Extension policy + size cap.
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        if !self.extensions.iter().any(|e| e == ext) {
+        if !self.policy.admits(ext) || !self.policy.admits_size(meta.len()) {
             return None;
         }
 
@@ -211,6 +289,14 @@ fn extensions_for_language(lang: &str) -> &'static [&'static str] {
         "dart" => &["dart"],
         "yaml" => &["yaml", "yml"],
         "json" => &["json"],
+        "xml" => &["xml"],
+        // Build / manifest config formats for mobile & JVM projects. No
+        // tree-sitter — line-chunked like the other structured-text buckets.
+        // `xml` (above) covers AndroidManifest.xml and res/values/*.xml;
+        // `gradle` covers build.gradle / settings.gradle (Groovy DSL);
+        // `properties` covers gradle.properties / gradle-wrapper.properties.
+        "gradle" => &["gradle"],
+        "properties" => &["properties"],
         // Plain-text-ish formats. No tree-sitter for these — the line
         // chunker (the default fallback) handles them well because they
         // tend to be small and have flat structure.
@@ -245,6 +331,9 @@ fn language_from_ext(ext: &str) -> String {
         "dart" => "dart",
         "yaml" | "yml" => "yaml",
         "json" => "json",
+        "xml" => "xml",
+        "gradle" => "gradle",
+        "properties" => "properties",
         "sh" | "bash" | "zsh" => "shell",
         "service" | "socket" | "timer" | "mount" | "target" | "path" => "systemd",
         "env" => "env",
@@ -252,4 +341,62 @@ fn language_from_ext(ext: &str) -> String {
         _ => "text",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn whitelist(langs: &[&str]) -> ExtPolicy {
+        ExtPolicy::from_languages(&langs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn whitelist_admits_only_listed_language_extensions() {
+        // Enabling these languages admits the Android manifest / resource /
+        // build-config surface (previously dropped entirely) and nothing else.
+        let p = whitelist(&["xml", "gradle", "properties"]);
+        for ext in ["xml", "gradle", "properties"] {
+            assert!(p.admits(ext), "{ext} should be admitted");
+        }
+        assert!(!p.admits("rs"), "rs not in the list");
+        assert!(!p.admits(""), "extensionless not in the list");
+        // Explicit whitelist never caps size — you named these types.
+        assert!(p.admits_size(MAX_FILE_BYTES + 1));
+    }
+
+    #[test]
+    fn empty_languages_is_all_but_binary() {
+        // Zero-config default: index everything textual, skip known binaries.
+        let p = ExtPolicy::from_languages(&[]);
+        assert!(matches!(p, ExtPolicy::AllButBinary));
+        // Text / code / config admitted, including extensionless (Makefile).
+        for ext in ["rs", "java", "xml", "gradle", "toml", "md", "kt", "swift", ""] {
+            assert!(p.admits(ext), "{ext:?} should be admitted by default");
+        }
+        // Known binaries rejected without a config change.
+        for ext in ["png", "jar", "so", "spv", "dex", "class", "obj", "PNG", "gguf"] {
+            assert!(!p.admits(ext), "{ext:?} is binary, must be rejected");
+        }
+        // Oversize files skipped under the default; within-cap admitted.
+        assert!(p.admits_size(MAX_FILE_BYTES));
+        assert!(!p.admits_size(MAX_FILE_BYTES + 1));
+    }
+
+    #[test]
+    fn language_maps_back_to_its_bucket() {
+        assert_eq!(language_from_ext("xml"), "xml");
+        assert_eq!(language_from_ext("gradle"), "gradle");
+        assert_eq!(language_from_ext("properties"), "properties");
+        // Unknown text extension falls through to the line-chunked `text` bucket.
+        assert_eq!(language_from_ext("kt"), "text");
+    }
+
+    #[test]
+    fn binary_extension_check_is_case_insensitive() {
+        assert!(is_binary_extension("png"));
+        assert!(is_binary_extension("PNG"));
+        assert!(is_binary_extension("Spv"));
+        assert!(!is_binary_extension("rs"));
+    }
 }

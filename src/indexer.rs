@@ -307,6 +307,18 @@ pub async fn delete_file_from_indexes(
     Ok(())
 }
 
+/// Read a file as UTF-8 text, returning `Ok(None)` when it looks binary — a
+/// NUL byte anywhere, or bytes that aren't valid UTF-8. Binary content is an
+/// expected, non-fatal skip under the all-but-binary walk default, so we
+/// distinguish it from a genuine I/O error (`Err`).
+fn read_text_file(path: &Path) -> std::io::Result<Option<String>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.contains(&0) {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(bytes).ok())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn process_one_file(
     embedder: &embedding::Client,
@@ -318,8 +330,15 @@ pub async fn process_one_file(
     entry: &walker::FileEntry,
     batcher: &mut AdaptiveBatcher,
 ) -> Result<()> {
-    let content = match std::fs::read_to_string(&entry.absolute) {
-        Ok(c) => c,
+    let content = match read_text_file(&entry.absolute) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            // Binary content (NUL byte or invalid UTF-8). Expected, not an
+            // error: the all-but-binary walk default can admit an unlisted
+            // binary type (extensionless executable, exotic extension).
+            debug!(file = %entry.relative.display(), "skip binary file");
+            return Ok(());
+        }
         Err(e) => {
             warn!(file = %entry.relative.display(), error = %e, "skip unreadable file");
             return Ok(());
@@ -374,7 +393,7 @@ pub async fn process_one_file(
 
     let mut points = Vec::new();
     let mut skipped_in_file = 0usize;
-    for (chunk, vector_opt) in chunks.iter().zip(vectors_opt.into_iter()) {
+    for (chunk, vector_opt) in chunks.iter().zip(vectors_opt) {
         let Some(vector) = vector_opt else {
             skipped_in_file += 1;
             continue;
