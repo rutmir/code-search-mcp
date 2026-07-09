@@ -90,6 +90,7 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// rejected; the indexer's NUL/UTF-8 sniff is the backstop for binaries not
 /// listed here (extensionless executables, exotic types). Matched
 /// case-insensitively.
+#[rustfmt::skip]
 const BINARY_EXTENSIONS: &[&str] = &[
     // images
     "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff", "tif", "svg", "psd", "heic",
@@ -371,11 +372,15 @@ mod tests {
         let p = ExtPolicy::from_languages(&[]);
         assert!(matches!(p, ExtPolicy::AllButBinary));
         // Text / code / config admitted, including extensionless (Makefile).
-        for ext in ["rs", "java", "xml", "gradle", "toml", "md", "kt", "swift", ""] {
+        for ext in [
+            "rs", "java", "xml", "gradle", "toml", "md", "kt", "swift", "",
+        ] {
             assert!(p.admits(ext), "{ext:?} should be admitted by default");
         }
         // Known binaries rejected without a config change.
-        for ext in ["png", "jar", "so", "spv", "dex", "class", "obj", "PNG", "gguf"] {
+        for ext in [
+            "png", "jar", "so", "spv", "dex", "class", "obj", "PNG", "gguf",
+        ] {
             assert!(!p.admits(ext), "{ext:?} is binary, must be rejected");
         }
         // Oversize files skipped under the default; within-cap admitted.
