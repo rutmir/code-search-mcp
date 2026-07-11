@@ -2,10 +2,8 @@
 
 A **token-saving, quality-first replacement** for Claude Code's built-in `Explore` / Grep+Read iterative search. Exposed to Claude Code as an MCP server, it returns a ranked list of code chunks for any natural-language query in a single tool call.
 
-[![CI](https://github.com/<owner>/code-search-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/code-search-mcp/actions/workflows/ci.yml)
+[![CI](https://github.com/rutmir/code-search-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/rutmir/code-search-mcp/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-
-> Replace `<owner>` in the CI badge URL with your GitHub username/org after the first push.
 
 ## Why
 
