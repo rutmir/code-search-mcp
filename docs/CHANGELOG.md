@@ -2,6 +2,27 @@
 
 History of significant changes. Newest at the top. Dates are when work landed locally; this project doesn't tag releases yet.
 
+## 2026-08-14 — v0.0.6
+
+### AIMD: a failed batch could be re-sent byte-identical
+
+`note_failure` halved the char *budget*, but nothing tied the next batch to the size of the one that had just failed. When the failing batch already fit under the halved budget, `pack` reproduced it exactly and the same request went out again — waiting out another full timeout to learn nothing. Progress was guaranteed only indirectly, by the budget eventually falling below the batch size, and each futile round cost one complete timeout.
+
+Seen during the v0.0.5 rebuild of a real project, on a 17-chunk / 118 075-char markdown file:
+
+```
+budget=256000 → batch 17 chunks / 118075 chars → timeout → budget 128000
+budget=128000 → batch 17 chunks / 118075 chars → timeout → budget  64000
+```
+
+`batch_size` and `batch_chars` identical across both attempts; ~10 minutes spent re-sending a request already known to fail. The pattern repeated on several large documents and is a meaningful share of why that rebuild took 3.5 hours.
+
+A failure now also arms a one-shot **retry ceiling** at half the failing batch's size, which caps `pack` alongside the budget. Every retry is therefore strictly smaller than what just failed. The ceiling is cleared by the next success, so the budget remains the thing that carries learned capacity between files and throughput still recovers fully after a transient failure. Repeated failures tighten the ceiling monotonically rather than resetting it.
+
+Behaviour that did not change: `pack` still always yields at least one chunk, so a single oversized chunk reaches the caller's skip path instead of stalling the loop; the budget still halves on failure and still floors at `MIN_BUDGET`.
+
+Not addressed here, and still open: the AIMD ceiling (256 KB) is optimistic for a CPU-bound llama.cpp server, so the budget oscillates up to the cap and back; and `embedding.timeout_secs` silently caps the throughput-derived timeout, making that failure indistinguishable from a genuine "too large". Both want measurement rather than a guess.
+
 ## 2026-08-14 — v0.0.5
 
 **⚠ Upgrade note: the first `index` / `serve` start after this upgrade auto-clears and fully rebuilds the index** (BM25 schema revision 2 → 3 for the new stored AST fields; re-embeds the whole corpus — plan for first-index duration).
