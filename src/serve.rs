@@ -7,11 +7,12 @@
 //!
 //! Scope:
 //!   - `initialize` / `notifications/initialized` handshake
-//!   - `tools/list` advertising the `code_search` tool
-//!   - `tools/call` dispatching to [`crate::search::run`]; each call runs
-//!     in its own spawned task, tracked by request id
+//!   - `tools/list` advertising `code_search` and `code_read_chunk`
+//!   - `tools/call` dispatching to [`crate::search::SearchContext`]; each
+//!     call runs in its own spawned task, tracked by request id
 //!   - `notifications/cancelled` — preempts the matching in-flight search
 //!     via a oneshot raced in `tokio::select!`
+//!   - `notifications/progress` for calls that supply a progress token
 //!   - `ping` as a health-check
 //!   - background watcher task (when `[watcher].enabled`)
 //!
@@ -24,25 +25,34 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
-use crate::search::{self, SearchParams};
+use crate::search::{SearchContext, SearchParams, SearchResult, SearchStage};
 use crate::watcher;
 
 /// Map from JSON-RPC stringified request id → cancel sender. A spawned
 /// tools/call task races search vs. its cancel receiver in a select!,
 /// so a send through the sender preempts the search and yields a clean
 /// "cancelled" response.
-type InFlight = Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<()>>>>;
+type InFlight = Mutex<HashMap<String, oneshot::Sender<()>>>;
 
-/// Latest MCP protocol version this server implements.
-const PROTOCOL_VERSION: &str = "2024-11-05";
+/// MCP protocol version this server implements, and the older revisions
+/// it still speaks. On `initialize` we echo the client's version when
+/// it's one we know; otherwise we answer with our own and let the client
+/// decide whether to proceed (per the MCP handshake rules).
+const PROTOCOL_VERSION: &str = "2025-06-18";
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const SERVER_NAME: &str = "code-search-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Cap on the text `code_read_chunk` returns in one call. The tool exists
+/// to save the caller a `Read`, not to become a way to pull a whole file
+/// into context by accident.
+const MAX_READ_CHUNK_CHARS: usize = 20_000;
 
 /// Standard JSON-RPC 2.0 error codes. Listed in full so we can pick the
 /// closest one when reporting protocol-level failures; `ERR_INTERNAL` is
@@ -54,6 +64,48 @@ const ERR_METHOD_NOT_FOUND: i32 = -32601;
 const ERR_INVALID_PARAMS: i32 = -32602;
 #[allow(dead_code)]
 const ERR_INTERNAL: i32 = -32603;
+
+/// Process-wide server state: the shared search context plus the
+/// cancellation registry.
+struct ServerState {
+    config: Config,
+    /// Built once and reused so every query keeps warm HTTP connection
+    /// pools and an open tantivy reader. Lazily initialized with retry
+    /// rather than required at startup: `serve` is spawned by the MCP
+    /// client and must stay up (reporting tool-level errors) even when
+    /// Qdrant isn't reachable yet, otherwise the tool vanishes from the
+    /// session instead of explaining itself.
+    ctx: tokio::sync::Mutex<Option<Arc<SearchContext>>>,
+    in_flight: InFlight,
+}
+
+impl ServerState {
+    fn new(config: &Config) -> Self {
+        Self {
+            config: config.clone(),
+            ctx: tokio::sync::Mutex::new(None),
+            in_flight: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn context(&self) -> Result<Arc<SearchContext>> {
+        let mut guard = self.ctx.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        let built = Arc::new(SearchContext::new(&self.config).await?);
+        *guard = Some(Arc::clone(&built));
+        Ok(built)
+    }
+
+    /// A poisoned lock means an earlier task panicked while holding it.
+    /// The map is a registry of cancel channels, not an invariant a panic
+    /// could have half-broken, so recovering beats refusing every
+    /// subsequent call for the life of the process.
+    fn in_flight(&self) -> MutexGuard<'_, HashMap<String, oneshot::Sender<()>>> {
+        self.in_flight.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 pub async fn run(config: &Config) -> Result<()> {
     info!(
@@ -121,6 +173,18 @@ pub async fn run(config: &Config) -> Result<()> {
 ///   - Lightweight requests (initialize / tools/list / ping) are handled
 ///     synchronously inline since they return in ~milliseconds.
 async fn serve_loop(config: &Config) -> Result<()> {
+    let state = Arc::new(ServerState::new(config));
+    // Warm the shared context up front so the first real query doesn't pay
+    // for connection setup and the marker check. Failure here is not fatal
+    // — see ServerState::ctx.
+    match state.context().await {
+        Ok(_) => info!("search context ready"),
+        Err(e) => warn!(
+            error = %e,
+            "search context not ready at startup; will retry on first query"
+        ),
+    }
+
     let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
     let _reader_task = tokio::spawn(async move {
         let stdin = tokio::io::stdin();
@@ -146,7 +210,6 @@ async fn serve_loop(config: &Config) -> Result<()> {
 
     let mut stdout = tokio::io::stdout();
     let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<Value>();
-    let in_flight: InFlight = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     loop {
         tokio::select! {
@@ -182,7 +245,7 @@ async fn serve_loop(config: &Config) -> Result<()> {
                 let is_notification = msg.get("id").is_none();
 
                 if is_notification {
-                    handle_notification(method, &msg, &in_flight);
+                    handle_notification(method, &msg, &state);
                     continue;
                 }
 
@@ -197,10 +260,9 @@ async fn serve_loop(config: &Config) -> Result<()> {
                     }
                     "tools/call" => {
                         spawn_tools_call(
-                            config,
+                            Arc::clone(&state),
                             id,
                             msg,
-                            Arc::clone(&in_flight),
                             resp_tx.clone(),
                         );
                     }
@@ -234,31 +296,27 @@ async fn serve_loop(config: &Config) -> Result<()> {
 /// the request id, runs the tool, and sends the result (or a cancelled
 /// marker) back through `resp_tx`.
 fn spawn_tools_call(
-    config: &Config,
+    state: Arc<ServerState>,
     id: Value,
     msg: Value,
-    in_flight: InFlight,
     resp_tx: mpsc::UnboundedSender<Value>,
 ) {
     let id_key = id_to_key(&id);
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    {
-        let mut guard = in_flight.lock().unwrap();
-        // If client somehow reuses an id (shouldn't happen — JSON-RPC ids are
-        // unique per pending request), the previous cancel sender is dropped
-        // silently. The previous task will see its receiver close and treat
-        // it as cancelled — acceptable.
-        guard.insert(id_key.clone(), cancel_tx);
-    }
+    // If client somehow reuses an id (shouldn't happen — JSON-RPC ids are
+    // unique per pending request), the previous cancel sender is dropped
+    // silently. The previous task will see its receiver close and treat
+    // it as cancelled — acceptable.
+    state.in_flight().insert(id_key.clone(), cancel_tx);
 
-    let config_clone = config.clone();
-    let in_flight_clone = Arc::clone(&in_flight);
+    let state_clone = Arc::clone(&state);
     let id_clone = id.clone();
     let id_key_clone = id_key.clone();
+    let progress_tx = resp_tx.clone();
 
     tokio::spawn(async move {
         let response: Value = tokio::select! {
-            result = handle_tools_call(&config_clone, &msg) => match result {
+            result = handle_tools_call(&state_clone, &msg, &progress_tx) => match result {
                 Ok(r) => ok_response(id_clone, r),
                 Err((code, m)) => error_response(id_clone, code, &m),
             },
@@ -280,12 +338,12 @@ fn spawn_tools_call(
         // Clean up the in-flight entry. May already be gone if the cancel
         // notification was the one that ended the task (it removes too) —
         // remove is idempotent.
-        in_flight_clone.lock().unwrap().remove(&id_key_clone);
+        state.in_flight().remove(&id_key_clone);
         let _ = resp_tx.send(response);
     });
 }
 
-fn handle_notification(method: &str, msg: &Value, in_flight: &InFlight) {
+fn handle_notification(method: &str, msg: &Value, state: &ServerState) {
     match method {
         "notifications/initialized" => {
             info!("client confirmed initialized");
@@ -296,7 +354,7 @@ fn handle_notification(method: &str, msg: &Value, in_flight: &InFlight) {
                 return;
             };
             let id_key = id_to_key(req_id);
-            let removed = in_flight.lock().unwrap().remove(&id_key);
+            let removed = state.in_flight().remove(&id_key);
             match removed {
                 Some(cancel_tx) => {
                     let _ = cancel_tx.send(());
@@ -323,11 +381,28 @@ fn id_to_key(id: &Value) -> String {
     serde_json::to_string(id).unwrap_or_else(|_| "null".to_string())
 }
 
-fn handle_initialize(_msg: &Value) -> Value {
-    // We don't actually do anything with the client's `protocolVersion` /
-    // `capabilities` / `clientInfo` yet — just advertise our own.
+fn handle_initialize(msg: &Value) -> Value {
+    // Version negotiation: answer in the client's dialect when we speak
+    // it, otherwise state our own and let the client decide. The wire
+    // shape of everything this server implements is identical across the
+    // supported revisions, so echoing back is honest.
+    let requested = msg
+        .pointer("/params/protocolVersion")
+        .and_then(|v| v.as_str());
+    let agreed = match requested {
+        Some(v) if SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => v,
+        Some(other) => {
+            warn!(
+                requested = other,
+                offering = PROTOCOL_VERSION,
+                "client asked for an unsupported MCP protocol version"
+            );
+            PROTOCOL_VERSION
+        }
+        None => PROTOCOL_VERSION,
+    };
     json!({
-        "protocolVersion": PROTOCOL_VERSION,
+        "protocolVersion": agreed,
         "capabilities": {
             "tools": {}
         },
@@ -412,6 +487,42 @@ fn handle_tools_list() -> Value {
                 },
                 "required": ["query"]
             }
+        }, {
+            "name": "code_read_chunk",
+            "description": "Fetch the FULL text of an indexed chunk you already located with \
+                            code_search. Use it instead of Read when a code_search preview was \
+                            cut off and you only need that one function / section — it answers \
+                            from the index, so it costs no file I/O and returns exactly the \
+                            chunk, not the surrounding file. \
+                            \n\n\
+                            Pass the `file` and the line range exactly as printed in the \
+                            code_search header (`src/foo.rs:120-168` → file='src/foo.rs', \
+                            start_line=120, end_line=168). Every indexed chunk overlapping that \
+                            range is returned. Omit the range to get all chunks of the file. \
+                            \n\n\
+                            Fall back to Read when you need lines the index doesn't cover \
+                            (gitignored or excluded files), or the file's exact bytes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Repo-relative path exactly as printed by code_search \
+                                        (the part before ':')."
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "First line of the range. Omit for the whole file.",
+                        "minimum": 1
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line of the range, inclusive. Omit for the whole file.",
+                        "minimum": 1
+                    }
+                },
+                "required": ["file"]
+            }
         }]
     })
 }
@@ -419,21 +530,38 @@ fn handle_tools_list() -> Value {
 /// Handle `tools/call`. Returns Ok(result_value) for success (including
 /// tool-level failures, which use `isError: true` inside the result) or
 /// Err((code, msg)) for protocol-level errors (bad params, etc).
-async fn handle_tools_call(config: &Config, msg: &Value) -> Result<Value, (i32, String)> {
+async fn handle_tools_call(
+    state: &ServerState,
+    msg: &Value,
+    resp_tx: &mpsc::UnboundedSender<Value>,
+) -> Result<Value, (i32, String)> {
     let name = msg
         .pointer("/params/name")
         .and_then(|v| v.as_str())
         .ok_or((ERR_INVALID_PARAMS, "missing 'params.name'".to_string()))?;
-
-    if name != "code_search" {
-        return Err((ERR_METHOD_NOT_FOUND, format!("unknown tool: {}", name)));
-    }
 
     let args = msg
         .pointer("/params/arguments")
         .cloned()
         .unwrap_or(Value::Null);
 
+    match name {
+        "code_search" => {
+            let progress_token = msg.pointer("/params/_meta/progressToken").cloned();
+            handle_code_search(state, &args, progress_token, resp_tx).await
+        }
+        "code_read_chunk" => handle_code_read_chunk(state, &args).await,
+        other => Err((ERR_METHOD_NOT_FOUND, format!("unknown tool: {}", other))),
+    }
+}
+
+async fn handle_code_search(
+    state: &ServerState,
+    args: &Value,
+    progress_token: Option<Value>,
+    resp_tx: &mpsc::UnboundedSender<Value>,
+) -> Result<Value, (i32, String)> {
+    let config = &state.config;
     let query = args
         .get("query")
         .and_then(|v| v.as_str())
@@ -454,20 +582,44 @@ async fn handle_tools_call(config: &Config, msg: &Value) -> Result<Value, (i32, 
         "tools/call code_search"
     );
 
+    // A quality-first search can take a minute or more; without this the
+    // client sees a silent stall and can't tell a slow search from a hung
+    // server. Only emitted when the client opted in with a progress token.
+    let sink = progress_token.map(|token| {
+        let tx = resp_tx.clone();
+        move |stage: SearchStage| {
+            let _ = tx.send(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {
+                    "progressToken": token,
+                    "progress": stage.step(),
+                    "total": SearchStage::TOTAL,
+                    "message": stage.label(),
+                }
+            }));
+        }
+    });
+
     let started = std::time::Instant::now();
-    let result = search::run(
-        config,
-        SearchParams {
-            query,
-            limit,
-            // Always use rerank in serve mode (when configured). Skipping
-            // it is a CLI debugging knob, not useful via MCP.
-            use_rerank: true,
-            lang,
-            path,
-        },
-    )
-    .await;
+    let result = match state.context().await {
+        Ok(ctx) => {
+            ctx.search(SearchParams {
+                query,
+                limit,
+                // Always use rerank in serve mode (when configured). Skipping
+                // it is a CLI debugging knob, not useful via MCP.
+                use_rerank: true,
+                lang,
+                path,
+                progress: sink
+                    .as_ref()
+                    .map(|f| f as &(dyn Fn(SearchStage) + Send + Sync)),
+            })
+            .await
+        }
+        Err(e) => Err(e),
+    };
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     match result {
@@ -505,6 +657,98 @@ async fn handle_tools_call(config: &Config, msg: &Value) -> Result<Value, (i32, 
     }
 }
 
+async fn handle_code_read_chunk(state: &ServerState, args: &Value) -> Result<Value, (i32, String)> {
+    let file = args
+        .get("file")
+        .and_then(|v| v.as_str())
+        .ok_or((ERR_INVALID_PARAMS, "missing 'file' argument".to_string()))?;
+    let start = args.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1);
+    let end = args
+        .get("end_line")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::MAX);
+    if end < start {
+        return Err((
+            ERR_INVALID_PARAMS,
+            format!("end_line ({}) is before start_line ({})", end, start),
+        ));
+    }
+
+    info!(file = %file, start, "tools/call code_read_chunk");
+
+    let ctx = match state.context().await {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(tool_error(format!("Index unavailable: {:#}", e)));
+        }
+    };
+    match ctx.read_chunks(file, start, end) {
+        Ok(chunks) if chunks.is_empty() => Ok(tool_error(format!(
+            "No indexed chunk for {}:{}-{}. The path must match a code_search result exactly \
+             (repo-relative, not absolute); if the file isn't indexed, use Read.",
+            file, start, end
+        ))),
+        Ok(chunks) => Ok(json!({
+            "content": [{ "type": "text", "text": format_chunks_for_llm(&chunks) }],
+            "isError": false
+        })),
+        Err(e) => {
+            warn!(file = %file, error = %e, "tools/call code_read_chunk failed");
+            Ok(tool_error(format!("Chunk read failed: {:#}", e)))
+        }
+    }
+}
+
+fn tool_error(text: String) -> Value {
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": true
+    })
+}
+
+/// Render chunk texts verbatim — unlike search previews, whitespace is
+/// preserved: the caller asked for this to read code, and reindented code
+/// is worse than no code.
+fn format_chunks_for_llm(chunks: &[crate::bm25::ChunkText]) -> String {
+    let mut s = String::new();
+    let mut budget = MAX_READ_CHUNK_CHARS;
+    let mut truncated = 0usize;
+    for c in chunks {
+        let symbol = match (&c.kind, &c.name) {
+            (Some(k), Some(n)) => format!("  {} {}", k, n),
+            (Some(k), None) => format!("  {}", k),
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            s,
+            "{}:{}-{}  [{}]{}",
+            c.file, c.start_line, c.end_line, c.lang, symbol
+        );
+        if budget == 0 {
+            truncated += 1;
+            let _ = writeln!(s, "(omitted — output limit reached)\n");
+            continue;
+        }
+        let text: String = c.content.chars().take(budget).collect();
+        budget -= text.chars().count();
+        let _ = writeln!(s, "{}\n", text);
+    }
+    if budget == 0 {
+        let omitted = if truncated > 0 {
+            format!("; {} later chunk(s) omitted entirely", truncated)
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            s,
+            "NOTE: output truncated at {} chars{}. Narrow the line range or use Read for the \
+             full file.",
+            MAX_READ_CHUNK_CHARS, omitted
+        );
+    }
+    s
+}
+
 /// Append one JSON line describing a completed `code_search` call to the
 /// query log. Durable observability: MCP clients don't persist server
 /// stderr, so without this file there is no record of what was asked.
@@ -516,7 +760,7 @@ fn append_query_log(
     path_filter: Option<&str>,
     limit: usize,
     elapsed_ms: u64,
-    results: &[search::SearchResult],
+    results: &[SearchResult],
 ) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -566,7 +810,7 @@ fn append_query_log(
 /// from in subsequent reasoning. Lines stay short, paths are obvious,
 /// scores are visible for sanity-checking.
 fn format_results_for_llm(
-    results: &[search::SearchResult],
+    results: &[SearchResult],
     query: &str,
     elapsed_ms: u64,
     rerank_expected: bool,
@@ -678,21 +922,83 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_advertises_code_search() {
+    fn initialize_echoes_a_supported_client_version() {
+        // Claude Code still initializes with the 2024-11-05 revision; the
+        // handshake must answer in the dialect the client asked for.
+        for asked in SUPPORTED_PROTOCOL_VERSIONS {
+            let msg = json!({ "params": { "protocolVersion": asked } });
+            assert_eq!(handle_initialize(&msg)["protocolVersion"], *asked);
+        }
+    }
+
+    #[test]
+    fn initialize_falls_back_on_unknown_client_version() {
+        let msg = json!({ "params": { "protocolVersion": "1999-01-01" } });
+        assert_eq!(
+            handle_initialize(&msg)["protocolVersion"],
+            PROTOCOL_VERSION,
+            "unknown client version must get our own, not an echo"
+        );
+    }
+
+    #[test]
+    fn tools_list_advertises_both_tools() {
         let v = handle_tools_list();
         let tools = v["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "code_search");
-        let schema = &tools[0]["inputSchema"];
-        assert_eq!(schema["type"], "object");
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(names, vec!["code_search", "code_read_chunk"]);
+
+        let search_schema = &tools[0]["inputSchema"];
+        assert_eq!(search_schema["type"], "object");
         // Required props must include query.
-        let req = schema["required"].as_array().expect("required");
+        let req = search_schema["required"].as_array().expect("required");
         assert!(req.iter().any(|v| v.as_str() == Some("query")));
         // limit / lang / path are advertised as optional.
-        let props = schema["properties"].as_object().expect("props");
+        let props = search_schema["properties"].as_object().expect("props");
         for k in ["query", "limit", "lang", "path"] {
             assert!(props.contains_key(k), "missing schema for {}", k);
         }
+
+        let read_schema = &tools[1]["inputSchema"];
+        let req = read_schema["required"].as_array().expect("required");
+        assert!(req.iter().any(|v| v.as_str() == Some("file")));
+        let props = read_schema["properties"].as_object().expect("props");
+        for k in ["file", "start_line", "end_line"] {
+            assert!(props.contains_key(k), "missing schema for {}", k);
+        }
+    }
+
+    fn chunk(start: u64, end: u64, content: &str) -> crate::bm25::ChunkText {
+        crate::bm25::ChunkText {
+            file: "src/foo.rs".to_string(),
+            start_line: start,
+            end_line: end,
+            lang: "rust".to_string(),
+            kind: Some("fn".to_string()),
+            name: Some("bar".to_string()),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn read_chunk_output_preserves_layout() {
+        let s = format_chunks_for_llm(&[chunk(10, 12, "fn bar() {\n    do_thing()\n}")]);
+        assert!(s.contains("src/foo.rs:10-12"));
+        assert!(s.contains("fn bar"));
+        // Indentation survives — this is code the caller will read.
+        assert!(s.contains("\n    do_thing()"));
+        assert!(!s.contains("truncated"));
+    }
+
+    #[test]
+    fn read_chunk_output_is_capped() {
+        let huge = "x".repeat(MAX_READ_CHUNK_CHARS + 5_000);
+        let s = format_chunks_for_llm(&[chunk(1, 900, &huge), chunk(901, 950, "tail")]);
+        assert!(s.contains("truncated"));
+        // The second chunk's header is still shown so the caller knows what
+        // it didn't get.
+        assert!(s.contains("src/foo.rs:901-950"));
+        assert!(!s.contains("tail\n"));
     }
 
     #[test]
@@ -720,8 +1026,8 @@ mod tests {
         assert!(s.contains("no matches"));
     }
 
-    fn sample_result(rerank_score: Option<f32>) -> search::SearchResult {
-        search::SearchResult {
+    fn sample_result(rerank_score: Option<f32>) -> SearchResult {
+        SearchResult {
             file: "src/foo.rs".to_string(),
             start_line: 10,
             end_line: 20,

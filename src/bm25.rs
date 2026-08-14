@@ -1,14 +1,15 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::Path;
 use tantivy::{
     collector::TopDocs,
-    query::{QueryParser, TermQuery},
+    query::{BooleanQuery, Occur, Query, QueryParser, TermQuery, TermSetQuery},
     schema::{
         Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, INDEXED, STORED,
         STRING,
     },
     tokenizer::{Token, TokenStream, Tokenizer},
-    Index, IndexWriter, TantivyDocument, Term,
+    Index, IndexReader, IndexWriter, TantivyDocument, Term,
 };
 
 /// Bump this whenever the tantivy schema or the content tokenizer changes
@@ -16,9 +17,18 @@ use tantivy::{
 /// `config_hard` fingerprint, so the change triggers the auto-clear +
 /// full-rebuild flow instead of silently searching a half-compatible index.
 /// v2: code-aware content tokenizer (snake_case / camelCase splitting).
-pub const SCHEMA_VERSION: u32 = 2;
+/// v3: AST metadata (`kind` / `name`) stored, `name` additionally indexed
+///     and searched with a boost.
+pub const SCHEMA_VERSION: u32 = 3;
 
 const CODE_TOKENIZER_NAME: &str = "code";
+
+/// Weight of the `name` field relative to `content` in the BM25 query.
+/// A chunk whose symbol name matches the query is a much stronger signal
+/// than the same tokens appearing somewhere in a body — but not a
+/// certainty, so this stays a boost rather than a filter. The exact-match
+/// case is handled separately by `search::query_names_symbol`.
+const NAME_FIELD_BOOST: tantivy::Score = 3.0;
 
 /// Tantivy BM25 index — sparse retrieval layer for hybrid search.
 ///
@@ -27,7 +37,10 @@ const CODE_TOKENIZER_NAME: &str = "code";
 ///   chunk_id   — STRING + STORED (used as delete key)
 ///   start_line — u64  + STORED + INDEXED
 ///   end_line   — u64  + STORED + INDEXED
-///   lang       — STRING + STORED
+///   lang       — STRING + STORED (exact match, drives the `lang` filter)
+///   kind       — STORED only (AST node kind; carried for display, never queried)
+///   name       — STORED + indexed with the code-aware tokenizer, searched
+///                alongside `content` at [`NAME_FIELD_BOOST`]
 ///   content    — STORED + indexed with the code-aware tokenizer (primary
 ///                BM25 search target; see [`CodeTokenizer`])
 pub struct Bm25Index {
@@ -42,7 +55,23 @@ pub struct SchemaFields {
     pub start_line: Field,
     pub end_line: Field,
     pub lang: Field,
+    pub kind: Field,
+    pub name: Field,
     pub content: Field,
+}
+
+/// One chunk as written to the BM25 index. A struct rather than a long
+/// positional argument list so the AST metadata can't be swapped with the
+/// path fields at a call site.
+pub struct ChunkDoc<'a> {
+    pub file: &'a str,
+    pub chunk_id: &'a str,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub lang: &'a str,
+    pub kind: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub content: &'a str,
 }
 
 impl Bm25Index {
@@ -70,26 +99,26 @@ impl Bm25Index {
         })
     }
 
-    pub fn upsert(
-        &mut self,
-        file: &str,
-        chunk_id: &str,
-        start_line: u64,
-        end_line: u64,
-        lang: &str,
-        content: &str,
-    ) -> Result<()> {
+    pub fn upsert(&mut self, doc: &ChunkDoc<'_>) -> Result<()> {
         // delete-then-insert (tantivy has no native upsert)
         self.writer
-            .delete_term(Term::from_field_text(self.fields.chunk_id, chunk_id));
+            .delete_term(Term::from_field_text(self.fields.chunk_id, doc.chunk_id));
 
         let mut d = TantivyDocument::new();
-        d.add_text(self.fields.file, file);
-        d.add_text(self.fields.chunk_id, chunk_id);
-        d.add_u64(self.fields.start_line, start_line);
-        d.add_u64(self.fields.end_line, end_line);
-        d.add_text(self.fields.lang, lang);
-        d.add_text(self.fields.content, content);
+        d.add_text(self.fields.file, doc.file);
+        d.add_text(self.fields.chunk_id, doc.chunk_id);
+        d.add_u64(self.fields.start_line, doc.start_line);
+        d.add_u64(self.fields.end_line, doc.end_line);
+        d.add_text(self.fields.lang, doc.lang);
+        // kind/name are absent for line-window and heading chunks; an
+        // omitted field simply has no value in tantivy.
+        if let Some(kind) = doc.kind {
+            d.add_text(self.fields.kind, kind);
+        }
+        if let Some(name) = doc.name {
+            d.add_text(self.fields.name, name);
+        }
+        d.add_text(self.fields.content, doc.content);
         self.writer
             .add_document(d)
             .context("adding doc to tantivy")?;
@@ -157,12 +186,17 @@ fn build_schema() -> (Schema, SchemaFields) {
     let start_line = b.add_u64_field("start_line", STORED | INDEXED);
     let end_line = b.add_u64_field("end_line", STORED | INDEXED);
     let lang = b.add_text_field("lang", STRING | STORED);
-    let content_opts = TextOptions::default().set_stored().set_indexing_options(
+    // Node kind ("fn", "struct", …) is display metadata only — storing it
+    // without indexing keeps the term dictionary free of a handful of
+    // ultra-high-frequency terms that would never make a useful query.
+    let kind = b.add_text_field("kind", STORED);
+    let text_opts = TextOptions::default().set_stored().set_indexing_options(
         TextFieldIndexing::default()
             .set_tokenizer(CODE_TOKENIZER_NAME)
             .set_index_option(IndexRecordOption::WithFreqsAndPositions),
     );
-    let content = b.add_text_field("content", content_opts);
+    let name = b.add_text_field("name", text_opts.clone());
+    let content = b.add_text_field("content", text_opts);
     let schema = b.build();
     (
         schema,
@@ -172,6 +206,8 @@ fn build_schema() -> (Schema, SchemaFields) {
             start_line,
             end_line,
             lang,
+            kind,
+            name,
             content,
         },
     )
@@ -330,15 +366,36 @@ pub struct SparseHit {
     pub start_line: u64,
     pub end_line: u64,
     pub lang: String,
+    pub kind: Option<String>,
+    pub name: Option<String>,
+    pub content: String,
+}
+
+/// Full text of one chunk, addressed by location rather than by chunk_id —
+/// what the `code_read_chunk` MCP tool hands back.
+#[derive(Debug, Clone)]
+pub struct ChunkText {
+    pub file: String,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub lang: String,
+    pub kind: Option<String>,
+    pub name: Option<String>,
     pub content: String,
 }
 
 /// Read-only view of the BM25 index. Unlike [`Bm25Index`], this does not
 /// allocate an [`IndexWriter`], so it doesn't take a write lock on the
-/// directory — multiple `search` invocations can coexist with the indexer
-/// (modulo whatever segments have been committed at the time of opening).
+/// directory — multiple `search` invocations can coexist with the indexer.
+///
+/// The [`IndexReader`] is created once and held: it carries tantivy's
+/// default `OnCommitWithDelay` reload policy, so a long-lived `serve`
+/// process still picks up the background watcher's commits, while queries
+/// stop paying for a reader (and its directory watch registration) each
+/// time. `searcher()` per query is the cheap part.
 pub struct Bm25Search {
     index: Index,
+    reader: IndexReader,
     fields: SchemaFields,
 }
 
@@ -348,23 +405,34 @@ impl Bm25Search {
         let index = Index::open_in_dir(path)
             .with_context(|| format!("opening tantivy index for search in {}", path.display()))?;
         register_code_tokenizer(&index);
-        Ok(Self { index, fields })
+        let reader = index.reader().context("creating tantivy reader")?;
+        Ok(Self {
+            index,
+            reader,
+            fields,
+        })
     }
 
-    /// BM25-rank documents by relevance to `query`.
+    /// BM25-rank documents by relevance to `query`, optionally restricted
+    /// to one language.
     ///
     /// Two defenses against QueryParser syntax in natural-language queries:
-    /// `:` is replaced by a space before parsing (we only ever search the
-    /// `content` field, so `field:value` syntax is never useful — but
-    /// `Watcher::run` would otherwise parse as a clause on a nonexistent
-    /// field and be dropped), and the rest is parsed leniently so stray
-    /// quotes / `+` / `-` can't fail the whole search.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SparseHit>> {
-        let reader = self.index.reader().context("creating tantivy reader")?;
-        let searcher = reader.searcher();
-        let parser = QueryParser::for_index(&self.index, vec![self.fields.content]);
+    /// `:` is replaced by a space before parsing (`field:value` syntax is
+    /// never useful here — but `Watcher::run` would otherwise parse as a
+    /// clause on a nonexistent field and be dropped), and the rest is
+    /// parsed leniently so stray quotes / `+` / `-` can't fail the whole
+    /// search.
+    ///
+    /// The `lang` restriction is a hard `Must` clause rather than a
+    /// post-filter: filtering after the fact would silently shrink the
+    /// candidate pool the caller asked for.
+    pub fn search(&self, query: &str, limit: usize, lang: Option<&str>) -> Result<Vec<SparseHit>> {
+        let searcher = self.reader.searcher();
+        let mut parser =
+            QueryParser::for_index(&self.index, vec![self.fields.content, self.fields.name]);
+        parser.set_field_boost(self.fields.name, NAME_FIELD_BOOST);
         let sanitized = query.replace(':', " ");
-        let (q, parse_errors) = parser.parse_query_lenient(&sanitized);
+        let (parsed, parse_errors) = parser.parse_query_lenient(&sanitized);
         if !parse_errors.is_empty() {
             tracing::debug!(
                 query = %query,
@@ -372,6 +440,19 @@ impl Bm25Search {
                 "bm25 query parsed leniently (some clauses dropped)"
             );
         }
+        let q: Box<dyn Query> = match lang {
+            Some(lang) => Box::new(BooleanQuery::new(vec![
+                (Occur::Must, parsed),
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.lang, lang),
+                        IndexRecordOption::Basic,
+                    )),
+                ),
+            ])),
+            None => parsed,
+        };
         let top = searcher
             .search(&q, &TopDocs::with_limit(limit))
             .context("running bm25 search")?;
@@ -385,31 +466,85 @@ impl Bm25Search {
                 start_line: extract_u64(&doc, self.fields.start_line),
                 end_line: extract_u64(&doc, self.fields.end_line),
                 lang: extract_str(&doc, self.fields.lang),
+                kind: extract_opt_str(&doc, self.fields.kind),
+                name: extract_opt_str(&doc, self.fields.name),
                 content: extract_str(&doc, self.fields.content),
             });
         }
         Ok(hits)
     }
 
-    /// Look up a single chunk's full content by its chunk_id. Used to
-    /// upgrade dense-only candidates (which only have the 200-char snippet
-    /// from Qdrant payload) to full text before reranking.
-    pub fn lookup_content(&self, chunk_id: &str) -> Result<Option<String>> {
-        let reader = self.index.reader().context("creating tantivy reader")?;
-        let searcher = reader.searcher();
-        let term = Term::from_field_text(self.fields.chunk_id, chunk_id);
-        let query = TermQuery::new(term, IndexRecordOption::Basic);
+    /// Look up the full content of many chunks at once, keyed by chunk_id.
+    /// Used to upgrade dense-only candidates (which carry only the 200-char
+    /// snippet from the Qdrant payload) to full text before reranking.
+    ///
+    /// One `TermSetQuery` instead of a query per id: the rerank head is
+    /// `rerank_top_n` candidates (30 by default), and a term-per-id round
+    /// trip through the collector was the single most repeated piece of
+    /// work in a search.
+    pub fn lookup_contents(&self, chunk_ids: &[String]) -> Result<HashMap<String, String>> {
+        if chunk_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let searcher = self.reader.searcher();
+        let terms = chunk_ids
+            .iter()
+            .map(|id| Term::from_field_text(self.fields.chunk_id, id));
+        let query = TermSetQuery::new(terms);
         let top = searcher
-            .search(&query, &TopDocs::with_limit(1))
-            .context("chunk_id term query")?;
-        let Some((_, addr)) = top.into_iter().next() else {
-            return Ok(None);
-        };
-        let doc: TantivyDocument = searcher.doc(addr).context("fetching chunk doc")?;
-        Ok(doc
-            .get_first(self.fields.content)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()))
+            .search(&query, &TopDocs::with_limit(chunk_ids.len()))
+            .context("chunk_id set query")?;
+        let mut out = HashMap::with_capacity(top.len());
+        for (_, addr) in top {
+            let doc: TantivyDocument = searcher.doc(addr).context("fetching chunk doc")?;
+            let id = extract_str(&doc, self.fields.chunk_id);
+            if id.is_empty() {
+                continue;
+            }
+            out.insert(id, extract_str(&doc, self.fields.content));
+        }
+        Ok(out)
+    }
+
+    /// Fetch every indexed chunk of `file` that overlaps the inclusive line
+    /// range `[start, end]`, ordered by start line. Backs the
+    /// `code_read_chunk` tool: the caller has a `file:start-end` header
+    /// from a previous search result and wants the untruncated text.
+    ///
+    /// A file's chunk count is bounded (large files are split, not
+    /// unbounded), so collecting all of its docs and filtering in memory
+    /// is cheaper than composing a range query per call.
+    pub fn chunks_in_range(&self, file: &str, start: u64, end: u64) -> Result<Vec<ChunkText>> {
+        let searcher = self.reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(self.fields.file, file),
+            IndexRecordOption::Basic,
+        );
+        // A single file's chunks; the cap is a safety valve for pathological
+        // generated files, not an expected limit.
+        let top = searcher
+            .search(&query, &TopDocs::with_limit(10_000))
+            .context("file term query")?;
+        let mut out = Vec::new();
+        for (_, addr) in top {
+            let doc: TantivyDocument = searcher.doc(addr).context("fetching chunk doc")?;
+            let chunk_start = extract_u64(&doc, self.fields.start_line);
+            let chunk_end = extract_u64(&doc, self.fields.end_line);
+            if chunk_end < start || chunk_start > end {
+                continue;
+            }
+            out.push(ChunkText {
+                file: extract_str(&doc, self.fields.file),
+                start_line: chunk_start,
+                end_line: chunk_end,
+                lang: extract_str(&doc, self.fields.lang),
+                kind: extract_opt_str(&doc, self.fields.kind),
+                name: extract_opt_str(&doc, self.fields.name),
+                content: extract_str(&doc, self.fields.content),
+            });
+        }
+        out.sort_by_key(|c| (c.start_line, c.end_line));
+        Ok(out)
     }
 }
 
@@ -418,6 +553,15 @@ fn extract_str(doc: &TantivyDocument, field: Field) -> String {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_default()
+}
+
+/// Like [`extract_str`] but distinguishes "field absent" from "empty
+/// string" — kind/name are genuinely optional (line-window and heading
+/// chunks have neither).
+fn extract_opt_str(doc: &TantivyDocument, field: Field) -> Option<String> {
+    doc.get_first(field)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn extract_u64(doc: &TantivyDocument, field: Field) -> u64 {
@@ -510,23 +654,38 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut idx = Bm25Index::open(&dir).unwrap();
-        idx.upsert(
-            "src/portfolio.rs",
-            "chunk-1",
-            10,
-            40,
-            "rust",
-            "pub fn build_si_portfolio(deposit: Decimal) -> Engine { }",
-        )
+        idx.upsert(&ChunkDoc {
+            file: "src/portfolio.rs",
+            chunk_id: "chunk-1",
+            start_line: 10,
+            end_line: 40,
+            lang: "rust",
+            kind: Some("fn"),
+            name: Some("build_si_portfolio"),
+            content: "pub fn build_si_portfolio(deposit: Decimal) -> Engine { }",
+        })
         .unwrap();
-        idx.upsert(
-            "src/other.rs",
-            "chunk-2",
-            1,
-            5,
-            "rust",
-            "fn unrelated_helper() {}",
-        )
+        idx.upsert(&ChunkDoc {
+            file: "src/other.rs",
+            chunk_id: "chunk-2",
+            start_line: 1,
+            end_line: 5,
+            lang: "rust",
+            kind: Some("fn"),
+            name: Some("unrelated_helper"),
+            content: "fn unrelated_helper() {}",
+        })
+        .unwrap();
+        idx.upsert(&ChunkDoc {
+            file: "docs/guide.md",
+            chunk_id: "chunk-3",
+            start_line: 1,
+            end_line: 9,
+            lang: "markdown",
+            kind: None,
+            name: None,
+            content: "## Portfolio sizing\nHow build_si_portfolio decides deposit split.",
+        })
         .unwrap();
         idx.commit().unwrap();
         drop(idx);
@@ -538,7 +697,7 @@ mod tests {
             "portfolio sizing",
             "Portfolio::build_si_portfolio",
         ] {
-            let hits = search.search(query, 5).unwrap();
+            let hits = search.search(query, 5, None).unwrap();
             assert!(
                 hits.iter().any(|h| h.chunk_id == "chunk-1"),
                 "query {:?} should find chunk-1, got {:?}",
@@ -547,8 +706,48 @@ mod tests {
             );
         }
         // Garbage QueryParser syntax must not error out.
-        let hits = search.search("\"unbalanced AND build_si_portfolio", 5);
+        let hits = search.search("\"unbalanced AND build_si_portfolio", 5, None);
         assert!(hits.is_ok());
+
+        // AST metadata round-trips through the index.
+        let hits = search.search("build_si_portfolio", 5, None).unwrap();
+        let top = hits.iter().find(|h| h.chunk_id == "chunk-1").unwrap();
+        assert_eq!(top.kind.as_deref(), Some("fn"));
+        assert_eq!(top.name.as_deref(), Some("build_si_portfolio"));
+
+        // lang filter is a hard clause: markdown-only search never returns
+        // the Rust chunks even though they match the query better.
+        let hits = search
+            .search("build_si_portfolio portfolio", 5, Some("markdown"))
+            .unwrap();
+        assert!(!hits.is_empty(), "markdown chunk should still match");
+        assert!(
+            hits.iter().all(|h| h.lang == "markdown"),
+            "lang filter leaked non-markdown hits: {:?}",
+            hits.iter().map(|h| h.lang.clone()).collect::<Vec<_>>()
+        );
+
+        // Batch content lookup returns every requested id it knows about,
+        // and silently omits the ones it doesn't.
+        let map = search
+            .lookup_contents(&[
+                "chunk-1".to_string(),
+                "chunk-2".to_string(),
+                "no-such-chunk".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(map.len(), 2);
+        assert!(map["chunk-1"].contains("build_si_portfolio"));
+        assert!(search.lookup_contents(&[]).unwrap().is_empty());
+
+        // Range lookup returns overlapping chunks only.
+        let got = search.chunks_in_range("src/portfolio.rs", 10, 40).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name.as_deref(), Some("build_si_portfolio"));
+        assert!(search
+            .chunks_in_range("src/portfolio.rs", 100, 200)
+            .unwrap()
+            .is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }

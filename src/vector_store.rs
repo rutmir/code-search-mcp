@@ -584,41 +584,6 @@ impl Client {
         Ok(())
     }
 
-    /// Bulk-retrieve only the `kind` + `name` payload fields for the given
-    /// chunk IDs. Used to fill in AST metadata for sparse-only candidates
-    /// (BM25 hit but not in dense top-K): tantivy's schema doesn't store
-    /// the AST fields, so without this they'd appear in results without
-    /// the syntactic anchor.
-    pub async fn fetch_kind_name(
-        &self,
-        ids: &[String],
-    ) -> Result<HashMap<String, (Option<String>, Option<String>)>> {
-        if ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let url = format!("{}/collections/{}/points", self.base_url, self.collection);
-        let body = serde_json::json!({
-            "ids": ids,
-            "with_payload": { "include": ["kind", "name"] },
-            "with_vector": false,
-        });
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .context("qdrant POST points (retrieve)")?
-            .error_for_status()
-            .context("qdrant retrieve non-2xx")?;
-        let parsed: RetrieveResp = resp.json().await.context("parsing retrieve response")?;
-        let mut out = HashMap::with_capacity(parsed.result.len());
-        for p in parsed.result {
-            out.insert(p.id, (p.payload.kind, p.payload.name));
-        }
-        Ok(out)
-    }
-
     /// Scroll the entire collection once at startup to build the file→sha cache.
     /// This replaces the old index_state.json: Qdrant IS the source of truth for
     /// what has been indexed. A chunk's payload carries `file` + `file_sha256`,
@@ -731,26 +696,6 @@ struct SearchPoint {
     score: f32,
     #[serde(default)]
     payload: SearchPayload,
-}
-
-#[derive(Deserialize)]
-struct RetrieveResp {
-    result: Vec<RetrievePoint>,
-}
-
-#[derive(Deserialize)]
-struct RetrievePoint {
-    id: String,
-    #[serde(default)]
-    payload: KindNamePayload,
-}
-
-#[derive(Deserialize, Default)]
-struct KindNamePayload {
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
 }
 
 #[derive(Deserialize, Default)]

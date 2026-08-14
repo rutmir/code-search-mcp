@@ -131,6 +131,7 @@ async fn run_search(
             use_rerank,
             lang,
             path,
+            progress: None,
         },
     )
     .await?;

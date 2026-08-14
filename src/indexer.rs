@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::adaptive_batcher::{AdaptiveBatcher, MIN_BUDGET};
-use crate::bm25::Bm25Index;
+use crate::bm25::{Bm25Index, ChunkDoc};
 use crate::chunker::{Chunk, ChunkerSet};
 use crate::config::Config;
 use crate::embedding::{self, ErrorClass};
@@ -417,14 +417,16 @@ pub async fn process_one_file(
             vector,
             payload,
         });
-        bm25.upsert(
-            &rel_str,
-            &id,
-            chunk.start_line as u64,
-            chunk.end_line as u64,
-            &entry.language,
-            &chunk.text,
-        )?;
+        bm25.upsert(&ChunkDoc {
+            file: &rel_str,
+            chunk_id: &id,
+            start_line: chunk.start_line as u64,
+            end_line: chunk.end_line as u64,
+            lang: &entry.language,
+            kind: chunk.kind.as_deref(),
+            name: chunk.name.as_deref(),
+            content: &chunk.text,
+        })?;
     }
 
     if points.is_empty() {
