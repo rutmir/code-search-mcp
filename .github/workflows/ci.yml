@@ -43,3 +43,54 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-features
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Keep in sync with `rust-version` in Cargo.toml. Without this job
+      # the declared MSRV is only an assertion — CI otherwise proves
+      # nothing beyond "builds on latest stable".
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-msrv-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-msrv-cargo-
+
+      - name: cargo check
+        run: cargo check --all-targets --all-features
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # This job reports; it never writes back to the repo.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Deliberately not `rustsec/audit-check`: it publishes results through
+      # the Checks API, which needs `checks: write` and is unavailable to
+      # pull requests from forks — so it fails on permissions rather than on
+      # findings, which is the opposite of what a security job should do.
+      # A plain binary run reproduces exactly with `cargo audit` locally.
+      # Accepted advisories and their justification live in .cargo/audit.toml.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit
+        run: cargo audit

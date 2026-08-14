@@ -20,7 +20,7 @@ When Claude Code explores a codebase to answer a question, it currently does it 
 
 ## What it gives Claude Code
 
-Once wired up, your Claude Code session gets a single tool:
+Once wired up, your Claude Code session gets two tools. The first is the one you'll see used:
 
 ```jsonc
 // tools/call → code_search
@@ -43,6 +43,23 @@ Output (each hit carries `file:start-end`, language, syntactic kind+name, score,
 ```
 
 (The CLI `search` command additionally prints per-component `dense=` / `bm25=` / `rerank=` scores for debugging; the MCP response keeps them out to save tokens.)
+
+The second closes the loop when a preview isn't enough:
+
+```jsonc
+// tools/call → code_read_chunk
+{
+  "file": "crates/bot/src/execution/cross_pressure.rs",
+  "start_line": 69,  // optional — omit both for every chunk of the file
+  "end_line": 91
+}
+```
+
+Previews are capped at 600 chars, and without this the model's next move is `Read` on the whole file — spending back much of what the search saved. `code_read_chunk` returns the chunk's untruncated text straight from the index (no file I/O), capped at 20k chars per call.
+
+Both filters are exact about what they promise: `lang` is a hard restriction pushed into *both* retrieval sides, and a `path`-scoped query retrieves a deeper candidate pool so the filter can't starve the result set.
+
+Searches that take a while report `notifications/progress` (embedding → retrieving → reranking → finalizing) to clients that ask for it with a `_meta.progressToken`.
 
 ## How it works
 
@@ -221,6 +238,7 @@ A complete annotated example with every knob explained lives at `examples/full-c
 | `csharp` | tree-sitter | `Class.method` | namespaces descend without standalone emission |
 | `java` | tree-sitter | `Class.method` | classes / interfaces / enums / records / annotations |
 | `markdown` | headings | n/a | H1/H2 cuts, fenced-block aware |
+| `kotlin`, `swift` | lines | n/a | own bucket so they're whitelistable and filterable; no grammar wired up yet |
 | `toml`, `yaml`, `json` | lines (default) | n/a | structured config |
 | `shell`, `systemd`, `env`, `text` | lines | n/a | catch-all for `*.sh`, `*.service`, `*.env`, `*.ini`, `*.cfg`, `*.conf`, `*.example`, `*.local` |
 
@@ -249,7 +267,28 @@ INFO all checks passed
 ./target/release/code-search-mcp --config .claude/code-search.toml index
 ```
 
-The first run does a full scan + embed. Subsequent runs only process changed files (via sha-cache). On modest CPU hardware expect ~5–30 minutes for the first run of a typical mid-sized repo, then seconds for incremental updates.
+The first run does a full scan + embed. Subsequent runs only process changed files (via sha-cache), and within a changed file only the chunks whose text actually changed — editing one function in a large file re-embeds that function, not all forty of its chunks. On modest CPU hardware expect ~5–30 minutes for the first run of a typical mid-sized repo, then seconds for incremental updates.
+
+To see what's actually indexed at any point:
+
+```bash
+./target/release/code-search-mcp --config .claude/code-search.toml status
+```
+
+```
+project      myproject
+root         /home/u/proj
+collection   myproject_a1b2c3d4
+qdrant       48213 points
+marker       written by v0.0.4 on 1754870400 (u@workstation)
+  identity   match
+  config     hard: match   soft: match
+qdrant files 842
+tantivy      /home/u/.cache/code-search/myproject — 842 files
+drift        none — both stores agree
+```
+
+Unlike `check` (which pings the services), `status` is about the index itself: it's how you catch a config change you haven't reindexed for, or the two stores drifting apart. Read-only, and safe to run while `serve` or `watch` is going.
 
 ## Try a search from the CLI
 
@@ -292,7 +331,7 @@ Project-scoped MCP servers require **explicit approval the first time** (securit
 2. Accept the workspace trust prompt and approve the `code-search` server
 3. Verify with `claude mcp list` — your server should appear without the `⏸ Pending approval` marker
 
-After approval the `code_search` tool appears in Claude Code's tool list. The MCP server also runs the file watcher in the background (if `[watcher].enabled = true`), so the index stays live as you edit.
+After approval the `code_search` and `code_read_chunk` tools appear in Claude Code's tool list. The MCP server also runs the file watcher in the background (if `[watcher].enabled = true`), so the index stays live as you edit.
 
 ### Make Claude Code prefer `code_search` over Grep/Read
 

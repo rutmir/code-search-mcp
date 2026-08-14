@@ -15,12 +15,19 @@
 //! it veto power lets one model error sink a candidate both retrieval
 //! modalities agree on — fusing ranks keeps the retrieval consensus
 //! in play.
+//!
+//! Everything a query needs lives in [`SearchContext`], built once per
+//! process. `serve` holds one for its whole lifetime: the HTTP clients
+//! keep their connection pools warm, the tantivy reader stays open, and
+//! the project-identity marker is verified at startup rather than on
+//! every keystroke of a Claude Code session.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::{debug, warn};
 
-use crate::bm25::Bm25Search;
+use crate::bm25::{Bm25Search, ChunkText};
 use crate::config::Config;
 use crate::embedding;
 use crate::reranker;
@@ -34,6 +41,22 @@ const DEFAULT_RERANK_TOP_N: usize = 30;
 const DEFAULT_RRF_K: usize = 60;
 const DEFAULT_RERANK_WEIGHT: f32 = 2.0;
 const DEFAULT_SYMBOL_BOOST: f32 = 1.0;
+
+/// How much deeper to retrieve when a `path` filter is active.
+///
+/// `lang` is pushed down into both stores, but `path` is a substring
+/// match neither can express cheaply (Qdrant needs a full-text payload
+/// index and then matches *tokens*, not substrings; tantivy's `file`
+/// field is raw-tokenized). So `path` is applied after retrieval — which
+/// starves the result set unless the pool is widened first: scoping to
+/// `docs/` in a repo whose top-30 is all code otherwise returns nothing.
+/// Reranking still only ever sees `rerank_top_n` candidates, so the extra
+/// depth costs retrieval bandwidth, not cross-encoder time.
+const PATH_FILTER_OVERSAMPLE: usize = 10;
+
+/// Ceiling on the widened pool, so a pathological config can't ask either
+/// store for an unbounded page.
+const MAX_RETRIEVAL_K: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -57,308 +80,444 @@ pub struct SearchResult {
     pub name: Option<String>,
 }
 
+/// Coarse phase of a search, reported through [`SearchParams::progress`].
+/// Kept deliberately coarse: the point is telling a waiting MCP client
+/// that a multi-second search is alive and where it is, not fine-grained
+/// instrumentation (that's what `tracing` is for).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchStage {
+    Embedding,
+    Retrieving,
+    Reranking,
+    Finalizing,
+}
+
+impl SearchStage {
+    pub const TOTAL: u32 = 4;
+
+    pub fn step(self) -> u32 {
+        match self {
+            SearchStage::Embedding => 1,
+            SearchStage::Retrieving => 2,
+            SearchStage::Reranking => 3,
+            SearchStage::Finalizing => 4,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchStage::Embedding => "embedding query",
+            SearchStage::Retrieving => "retrieving candidates",
+            SearchStage::Reranking => "reranking",
+            SearchStage::Finalizing => "finalizing",
+        }
+    }
+}
+
+/// Callback invoked as the search moves between stages.
+pub type ProgressSink<'a> = &'a (dyn Fn(SearchStage) + Send + Sync);
+
 pub struct SearchParams<'a> {
     pub query: &'a str,
     pub limit: usize,
     pub use_rerank: bool,
     pub lang: Option<&'a str>,
     pub path: Option<&'a str>,
+    /// Optional progress callback. `None` for the CLI, `Some` when the
+    /// MCP client supplied a `_meta.progressToken`.
+    pub progress: Option<ProgressSink<'a>>,
 }
 
-pub async fn run(config: &Config, params: SearchParams<'_>) -> Result<Vec<SearchResult>> {
-    let started = std::time::Instant::now();
-
-    let k_dense = config.search.dense_k.unwrap_or(DEFAULT_K_DENSE);
-    let k_sparse = config.search.sparse_k.unwrap_or(DEFAULT_K_SPARSE);
-    let rerank_top_n = config.search.rerank_top_n.unwrap_or(DEFAULT_RERANK_TOP_N);
-    let rrf_k = config.search.rrf_k.unwrap_or(DEFAULT_RRF_K);
-
-    // 1. Embed the query. Same model as indexing — no asymmetric query/doc
-    //    encoders here; jina-code-embeddings is symmetric.
-    let embedder = embedding::Client::new(&config.embedding);
-    let mut vecs = embedder
-        .embed(vec![params.query.to_string()])
-        .await
-        .context("embedding query")?;
-    let query_vec = vecs.pop().context("empty embedding response for query")?;
-    debug!(
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "query embedded"
-    );
-
-    // 2. Dense + sparse in parallel.
-    let vs = vector_store::Client::new(
-        &config.vector_store,
-        config.vector_store.resolve_collection_name(&config.project),
-    )
-    .await?;
-    // Read-side marker check — bails if this collection's stored project
-    // identity doesn't match the current config's, so search NEVER returns
-    // chunks from a different project that happens to share the collection.
-    vs.verify_marker_read_only(config).await?;
-    let bm25 = Bm25Search::open(&config.bm25.index_path)?;
-
-    let (dense_res, sparse_res) =
-        tokio::join!(vs.search(&query_vec, k_dense, params.lang), async {
-            bm25.search(params.query, k_sparse)
-        });
-    let dense_hits = dense_res.context("dense search")?;
-    let sparse_hits = sparse_res.context("bm25 search")?;
-    debug!(
-        dense = dense_hits.len(),
-        sparse = sparse_hits.len(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "candidates gathered"
-    );
-
-    // 3. Merge by chunk_id using Reciprocal Rank Fusion.
-    let mut by_id: HashMap<String, Candidate> = HashMap::new();
-    for (rank, h) in dense_hits.iter().enumerate() {
-        let c = by_id
-            .entry(h.chunk_id.clone())
-            .or_insert_with(|| Candidate {
-                chunk_id: h.chunk_id.clone(),
-                file: h.file.clone(),
-                start_line: h.start_line,
-                end_line: h.end_line,
-                lang: h.lang.clone(),
-                preview: h.snippet.clone(),
-                content: None,
-                rrf: 0.0,
-                dense_score: None,
-                sparse_score: None,
-                kind: h.kind.clone(),
-                name: h.name.clone(),
-            });
-        c.dense_score = Some(h.score);
-        c.rrf += 1.0 / (rrf_k as f32 + rank as f32 + 1.0);
-    }
-    for (rank, h) in sparse_hits.iter().enumerate() {
-        let c = by_id
-            .entry(h.chunk_id.clone())
-            .or_insert_with(|| Candidate {
-                chunk_id: h.chunk_id.clone(),
-                file: h.file.clone(),
-                start_line: h.start_line,
-                end_line: h.end_line,
-                lang: h.lang.clone(),
-                preview: h.content.chars().take(200).collect(),
-                content: Some(h.content.clone()),
-                rrf: 0.0,
-                dense_score: None,
-                sparse_score: None,
-                // BM25 doesn't carry kind/name (tantivy schema doesn't store
-                // them). Stays None unless this same chunk_id also hit on
-                // the dense side, where the insert above filled them in.
-                kind: None,
-                name: None,
-            });
-        c.sparse_score = Some(h.score);
-        // BM25 brought the full content too — upgrade the preview if it
-        // came in only with a snippet from the dense side.
-        if c.content.is_none() {
-            c.content = Some(h.content.clone());
+impl SearchParams<'_> {
+    fn report(&self, stage: SearchStage) {
+        if let Some(sink) = self.progress {
+            sink(stage);
         }
-        c.rrf += 1.0 / (rrf_k as f32 + rank as f32 + 1.0);
+    }
+}
+
+/// Everything a query needs, built once and reused.
+pub struct SearchContext {
+    config: Config,
+    embedder: embedding::Client,
+    vs: vector_store::Client,
+    reranker: Option<reranker::Client>,
+    /// Opened lazily and dropped on failure so the next query retries.
+    /// Two situations make an eagerly-opened handle wrong: `serve` starts
+    /// before its background watcher has built the index for a brand-new
+    /// project, and a `config_hard` change deletes and recreates the
+    /// directory underneath a running process.
+    bm25: Mutex<Option<Arc<Bm25Search>>>,
+}
+
+impl SearchContext {
+    /// Build the context and verify the collection belongs to this project.
+    ///
+    /// The marker check is a startup concern, not a per-query one: it
+    /// guards against a misconfigured `vector_store.collection` pointing
+    /// at another project's data, and that config can't change without
+    /// restarting the process.
+    pub async fn new(config: &Config) -> Result<Self> {
+        let vs = vector_store::Client::new(
+            &config.vector_store,
+            config.vector_store.resolve_collection_name(&config.project),
+        )
+        .await?;
+        vs.verify_marker_read_only(config).await?;
+
+        Ok(Self {
+            config: config.clone(),
+            embedder: embedding::Client::new(&config.embedding),
+            vs,
+            reranker: config
+                .reranker
+                .as_ref()
+                .filter(|r| r.enabled)
+                .map(reranker::Client::new),
+            bm25: Mutex::new(None),
+        })
     }
 
-    // Optional path filter (substring on file path). Done post-merge so
-    // it applies uniformly to both modalities.
-    if let Some(prefix) = params.path {
-        by_id.retain(|_, c| c.file.contains(prefix));
+    /// A poisoned lock here means some earlier query panicked while
+    /// holding it. The guarded value is a cache handle, not an invariant
+    /// that a panic could have half-updated, so recovering beats taking
+    /// the whole server down for the rest of its life.
+    fn bm25_slot(&self) -> MutexGuard<'_, Option<Arc<Bm25Search>>> {
+        self.bm25.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    let mut merged: Vec<Candidate> = by_id.into_values().collect();
-    if merged.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Sorting happens below, after the symbol boost — which needs the
-    // kind/name metadata filled in for sparse-only candidates first.
-
-    // Fill kind/name for sparse-only candidates. BM25's tantivy schema
-    // doesn't carry the AST metadata (would require an incompatible
-    // schema migration), so any chunk that came in via BM25 alone has
-    // kind=None/name=None at this point. One Qdrant retrieve-by-IDs
-    // call patches them up — the chunk DEFINITELY has these stored
-    // (we indexed both stores together), it's just not in this
-    // candidate's local copy.
-    let missing_meta: Vec<String> = merged
-        .iter()
-        .filter(|c| c.kind.is_none() && c.name.is_none())
-        .map(|c| c.chunk_id.clone())
-        .collect();
-    if !missing_meta.is_empty() {
-        match vs.fetch_kind_name(&missing_meta).await {
-            Ok(map) => {
-                for c in merged.iter_mut() {
-                    if let Some((k, n)) = map.get(&c.chunk_id) {
-                        if c.kind.is_none() {
-                            c.kind = k.clone();
-                        }
-                        if c.name.is_none() {
-                            c.name = n.clone();
-                        }
-                    }
-                }
+    fn bm25(&self) -> Result<Arc<Bm25Search>> {
+        // The lock is taken and released twice on purpose: `Bm25Search::open`
+        // does file I/O, and holding a std Mutex across it would serialize
+        // every concurrent query behind one open. Two threads racing here
+        // both get a valid handle; one of them simply wins the cache slot.
+        {
+            let slot = self.bm25_slot();
+            if let Some(existing) = slot.as_ref() {
+                return Ok(Arc::clone(existing));
             }
+        }
+        let opened = Arc::new(Bm25Search::open(&self.config.bm25.index_path)?);
+        *self.bm25_slot() = Some(Arc::clone(&opened));
+        Ok(opened)
+    }
+
+    fn invalidate_bm25(&self) {
+        *self.bm25_slot() = None;
+    }
+
+    /// Full text of every indexed chunk of `file` overlapping the
+    /// inclusive line range. Backs the `code_read_chunk` MCP tool.
+    pub fn read_chunks(&self, file: &str, start: u64, end: u64) -> Result<Vec<ChunkText>> {
+        let bm25 = self.bm25()?;
+        match bm25.chunks_in_range(file, start, end) {
+            Ok(v) => Ok(v),
             Err(e) => {
-                // Non-fatal — the search still works, results just
-                // show without syntactic anchors for sparse-only hits.
-                warn!(error = %e, "failed to fetch kind/name for sparse-only candidates");
+                self.invalidate_bm25();
+                Err(e)
             }
         }
     }
 
-    // Exact-symbol boost: when the query literally names a chunk's symbol
-    // (`AdaptiveBatcher::note_failure`, `build_si_portfolio`, `Indexer`),
-    // that chunk gets one extra #1 rank-vote. This is what lets
-    // `code_search` win the "I know the symbol, find it" queries that
-    // would otherwise justify falling back to grep. Applied to the RRF
-    // before the head split so a symbol match also earns a rerank slot.
-    let symbol_boost = config.search.symbol_boost.unwrap_or(DEFAULT_SYMBOL_BOOST);
-    if symbol_boost > 0.0 {
-        let bonus = symbol_boost / (rrf_k as f32 + 1.0);
-        for c in merged.iter_mut() {
-            if let Some(name) = &c.name {
-                if query_names_symbol(params.query, name) {
-                    debug!(file = %c.file, name = %name, "exact symbol match — boosting");
-                    c.rrf += bonus;
-                }
+    pub async fn search(&self, params: SearchParams<'_>) -> Result<Vec<SearchResult>> {
+        let config = &self.config;
+        let started = std::time::Instant::now();
+
+        let rerank_top_n = config.search.rerank_top_n.unwrap_or(DEFAULT_RERANK_TOP_N);
+        let rrf_k = config.search.rrf_k.unwrap_or(DEFAULT_RRF_K);
+        // Widen the pool up front when a post-retrieval filter is in play.
+        let depth = |base: usize| {
+            if params.path.is_some() {
+                base.saturating_mul(PATH_FILTER_OVERSAMPLE)
+                    .min(MAX_RETRIEVAL_K)
+            } else {
+                base
             }
-        }
-    }
+        };
+        let k_dense = depth(config.search.dense_k.unwrap_or(DEFAULT_K_DENSE));
+        let k_sparse = depth(config.search.sparse_k.unwrap_or(DEFAULT_K_SPARSE));
 
-    merged.sort_by(|a, b| {
-        b.rrf
-            .partial_cmp(&a.rrf)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+        // 1. Embed the query. Same model as indexing — no asymmetric query/doc
+        //    encoders here; jina-code-embeddings is symmetric.
+        params.report(SearchStage::Embedding);
+        let mut vecs = self
+            .embedder
+            .embed(vec![params.query.to_string()])
+            .await
+            .context("embedding query")?;
+        let query_vec = vecs.pop().context("empty embedding response for query")?;
+        debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "query embedded"
+        );
 
-    debug!(
-        merged = merged.len(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "merged"
-    );
-
-    // 4. Two-stage rerank:
-    //    a) Split merged into head (top rerank_top_n by RRF) and tail (rest).
-    //    b) Upgrade head's previews to full chunk content (bm25 lookup for
-    //       dense-only candidates; BM25-side hits already have full text).
-    //    c) Cross-encoder scores the head; its rank-vote is fused into the
-    //       head's RRF scores. Tail keeps plain RRF score — consistent,
-    //       since every head candidate's fused score ≥ its RRF score ≥
-    //       any tail RRF score.
-    //    d) Final list = fused_head + tail (in that order), trimmed to
-    //       params.limit. For default config (limit=10, top_n=20), all
-    //       returned results are reranked.
-    //
-    //    If the reranker call fails (server down, ctx overflow, timeout),
-    //    we fall back to RRF-sorted results rather than failing the whole
-    //    search. The user still gets something useful; warn logged.
-    let want_rerank = params.use_rerank && config.reranker.as_ref().is_some_and(|r| r.enabled);
-
-    let mut head = merged;
-    let tail: Vec<Candidate> = if want_rerank && head.len() > rerank_top_n {
-        head.split_off(rerank_top_n)
-    } else {
-        Vec::new()
-    };
-
-    let head_results: Vec<SearchResult> = if want_rerank {
-        for c in &mut head {
-            if c.content.is_none() {
-                match bm25.lookup_content(&c.chunk_id) {
-                    Ok(Some(text)) => c.content = Some(text),
-                    Ok(None) => {
-                        // Dense hit with no BM25 doc for chunk_id —
-                        // shouldn't happen since we index both stores
-                        // together, but be defensive.
-                        warn!(
-                            chunk_id = %c.chunk_id,
-                            file = %c.file,
-                            "no BM25 doc for chunk_id; reranker will see snippet only"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            chunk_id = %c.chunk_id,
-                            error = %e,
-                            "lookup_content failed; reranker will see snippet only"
-                        );
-                    }
-                }
+        // 2. Dense + sparse in parallel. `lang` is a hard restriction on
+        //    both sides — pushing it down keeps each store's page full of
+        //    candidates the caller can actually use.
+        params.report(SearchStage::Retrieving);
+        let bm25 = self.bm25()?;
+        let (dense_res, sparse_res) =
+            tokio::join!(self.vs.search(&query_vec, k_dense, params.lang), async {
+                bm25.search(params.query, k_sparse, params.lang)
+            });
+        let dense_hits = dense_res.context("dense search")?;
+        let sparse_hits = match sparse_res {
+            Ok(hits) => hits,
+            Err(e) => {
+                self.invalidate_bm25();
+                return Err(e).context("bm25 search");
             }
-        }
-        let documents: Vec<String> = head
-            .iter()
-            .map(|c| c.content.clone().unwrap_or_else(|| c.preview.clone()))
-            .collect();
-        let rer = reranker::Client::new(config.reranker.as_ref().expect("reranker present"));
-        match rer.rerank(params.query, documents).await {
-            Ok(scores) => {
-                debug!(
-                    reranked = scores.len(),
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "reranked head"
-                );
-                let weight = config.search.rerank_weight.unwrap_or(DEFAULT_RERANK_WEIGHT);
-                let rrf_scores: Vec<f32> = head.iter().map(|c| c.rrf).collect();
-                let fused = fuse_rerank_votes(&rrf_scores, &scores, rrf_k, weight);
-                let mut with_scores: Vec<SearchResult> = head
-                    .into_iter()
-                    .zip(scores)
-                    .zip(fused)
-                    .map(|((c, rer_score), final_score)| {
-                        candidate_to_result(c, final_score, Some(rer_score))
-                    })
-                    .collect();
-                with_scores.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+        };
+        debug!(
+            dense = dense_hits.len(),
+            sparse = sparse_hits.len(),
+            k_dense,
+            k_sparse,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "candidates gathered"
+        );
+
+        // 3. Merge by chunk_id using Reciprocal Rank Fusion.
+        let mut by_id: HashMap<String, Candidate> = HashMap::new();
+        for (rank, h) in dense_hits.iter().enumerate() {
+            let c = by_id
+                .entry(h.chunk_id.clone())
+                .or_insert_with(|| Candidate {
+                    chunk_id: h.chunk_id.clone(),
+                    file: h.file.clone(),
+                    start_line: h.start_line,
+                    end_line: h.end_line,
+                    lang: h.lang.clone(),
+                    preview: h.snippet.clone(),
+                    content: None,
+                    rrf: 0.0,
+                    dense_score: None,
+                    sparse_score: None,
+                    kind: h.kind.clone(),
+                    name: h.name.clone(),
                 });
-                with_scores
+            c.dense_score = Some(h.score);
+            c.rrf += 1.0 / (rrf_k as f32 + rank as f32 + 1.0);
+        }
+        for (rank, h) in sparse_hits.iter().enumerate() {
+            let c = by_id
+                .entry(h.chunk_id.clone())
+                .or_insert_with(|| Candidate {
+                    chunk_id: h.chunk_id.clone(),
+                    file: h.file.clone(),
+                    start_line: h.start_line,
+                    end_line: h.end_line,
+                    lang: h.lang.clone(),
+                    preview: h.content.chars().take(200).collect(),
+                    content: Some(h.content.clone()),
+                    rrf: 0.0,
+                    dense_score: None,
+                    sparse_score: None,
+                    kind: h.kind.clone(),
+                    name: h.name.clone(),
+                });
+            c.sparse_score = Some(h.score);
+            // BM25 brought the full content too — upgrade the preview if it
+            // came in only with a snippet from the dense side.
+            if c.content.is_none() {
+                c.content = Some(h.content.clone());
             }
-            Err(e) => {
-                // Reranker is a quality boost, not a correctness requirement.
-                // Falling back to RRF lets the user keep using the system
-                // while they fix the rerank server (timeout, ctx overflow,
-                // model crash).
-                warn!(
-                    error = %e,
-                    "reranker failed; falling back to RRF-only ranking"
-                );
-                head.into_iter()
-                    .map(|c| {
-                        let rrf = c.rrf;
-                        candidate_to_result(c, rrf, None)
-                    })
-                    .collect()
+            c.rrf += 1.0 / (rrf_k as f32 + rank as f32 + 1.0);
+        }
+
+        // Optional path filter (substring on file path). Done post-merge so
+        // it applies uniformly to both modalities; the pool was widened
+        // above to absorb the loss.
+        if let Some(prefix) = params.path {
+            by_id.retain(|_, c| c.file.contains(prefix));
+        }
+        // Both stores were told the language, so this only ever fires on a
+        // payload/schema disagreement — cheap insurance that a `lang`-scoped
+        // query can never answer with another language.
+        if let Some(lang) = params.lang {
+            by_id.retain(|_, c| c.lang == lang);
+        }
+
+        let mut merged: Vec<Candidate> = by_id.into_values().collect();
+        if merged.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Exact-symbol boost: when the query literally names a chunk's symbol
+        // (`AdaptiveBatcher::note_failure`, `build_si_portfolio`, `Indexer`),
+        // that chunk gets one extra #1 rank-vote. This is what lets
+        // `code_search` win the "I know the symbol, find it" queries that
+        // would otherwise justify falling back to grep. Applied to the RRF
+        // before the head split so a symbol match also earns a rerank slot.
+        let symbol_boost = config.search.symbol_boost.unwrap_or(DEFAULT_SYMBOL_BOOST);
+        if symbol_boost > 0.0 {
+            let bonus = symbol_boost / (rrf_k as f32 + 1.0);
+            for c in merged.iter_mut() {
+                if let Some(name) = &c.name {
+                    if query_names_symbol(params.query, name) {
+                        debug!(file = %c.file, name = %name, "exact symbol match — boosting");
+                        c.rrf += bonus;
+                    }
+                }
             }
         }
-    } else {
-        // No rerank requested (or no reranker configured): RRF score is final.
-        head.into_iter()
+
+        merged.sort_by(|a, b| {
+            b.rrf
+                .partial_cmp(&a.rrf)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        debug!(
+            merged = merged.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "merged"
+        );
+
+        // 4. Two-stage rerank:
+        //    a) Split merged into head (top rerank_top_n by RRF) and tail (rest).
+        //    b) Upgrade head's previews to full chunk content (one batched
+        //       bm25 lookup for dense-only candidates; BM25-side hits already
+        //       have full text).
+        //    c) Cross-encoder scores the head; its rank-vote is fused into the
+        //       head's RRF scores. Tail keeps plain RRF score — consistent,
+        //       since every head candidate's fused score ≥ its RRF score ≥
+        //       any tail RRF score.
+        //    d) Final list = fused_head + tail (in that order), trimmed to
+        //       params.limit. For default config (limit=10, top_n=30), all
+        //       returned results are reranked.
+        //
+        //    If the reranker call fails (server down, ctx overflow, timeout),
+        //    we fall back to RRF-sorted results rather than failing the whole
+        //    search. The user still gets something useful; warn logged.
+        let want_rerank = params.use_rerank && self.reranker.is_some();
+
+        let mut head = merged;
+        let tail: Vec<Candidate> = if want_rerank && head.len() > rerank_top_n {
+            head.split_off(rerank_top_n)
+        } else {
+            Vec::new()
+        };
+
+        let head_results: Vec<SearchResult> = if want_rerank {
+            params.report(SearchStage::Reranking);
+            hydrate_content(&bm25, &mut head);
+            let documents: Vec<String> = head
+                .iter()
+                .map(|c| c.content.clone().unwrap_or_else(|| c.preview.clone()))
+                .collect();
+            let rer = self
+                .reranker
+                .as_ref()
+                .expect("want_rerank implies a reranker");
+            match rer.rerank(params.query, documents).await {
+                Ok(scores) => {
+                    debug!(
+                        reranked = scores.len(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "reranked head"
+                    );
+                    let weight = config.search.rerank_weight.unwrap_or(DEFAULT_RERANK_WEIGHT);
+                    let rrf_scores: Vec<f32> = head.iter().map(|c| c.rrf).collect();
+                    let fused = fuse_rerank_votes(&rrf_scores, &scores, rrf_k, weight);
+                    let mut with_scores: Vec<SearchResult> = head
+                        .into_iter()
+                        .zip(scores)
+                        .zip(fused)
+                        .map(|((c, rer_score), final_score)| {
+                            candidate_to_result(c, final_score, Some(rer_score))
+                        })
+                        .collect();
+                    with_scores.sort_by(|a, b| {
+                        b.score
+                            .partial_cmp(&a.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    with_scores
+                }
+                Err(e) => {
+                    // Reranker is a quality boost, not a correctness requirement.
+                    // Falling back to RRF lets the user keep using the system
+                    // while they fix the rerank server (timeout, ctx overflow,
+                    // model crash).
+                    warn!(
+                        error = %e,
+                        "reranker failed; falling back to RRF-only ranking"
+                    );
+                    head.into_iter()
+                        .map(|c| {
+                            let rrf = c.rrf;
+                            candidate_to_result(c, rrf, None)
+                        })
+                        .collect()
+                }
+            }
+        } else {
+            // No rerank requested (or no reranker configured): RRF score is final.
+            head.into_iter()
+                .map(|c| {
+                    let rrf = c.rrf;
+                    candidate_to_result(c, rrf, None)
+                })
+                .collect()
+        };
+
+        // Tail (everything past rerank_top_n) keeps RRF score. Only relevant
+        // when params.limit > rerank_top_n — otherwise the trim below drops it.
+        let tail_results: Vec<SearchResult> = tail
+            .into_iter()
             .map(|c| {
                 let rrf = c.rrf;
                 candidate_to_result(c, rrf, None)
             })
-            .collect()
-    };
+            .collect();
 
-    // Tail (everything past rerank_top_n) keeps RRF score. Only relevant
-    // when params.limit > rerank_top_n — otherwise the trim below drops it.
-    let tail_results: Vec<SearchResult> = tail
-        .into_iter()
-        .map(|c| {
-            let rrf = c.rrf;
-            candidate_to_result(c, rrf, None)
-        })
+        params.report(SearchStage::Finalizing);
+        let mut final_results = head_results;
+        final_results.extend(tail_results);
+        Ok(final_results.into_iter().take(params.limit).collect())
+    }
+}
+
+/// One-shot search: build a context, run a single query, drop it. The CLI
+/// path — `serve` holds a [`SearchContext`] instead.
+pub async fn run(config: &Config, params: SearchParams<'_>) -> Result<Vec<SearchResult>> {
+    let ctx = SearchContext::new(config).await?;
+    ctx.search(params).await
+}
+
+/// Give every rerank candidate its full chunk text. Dense-only candidates
+/// arrive with just the 200-char Qdrant snippet; one batched tantivy
+/// lookup fills them in. Failure is non-fatal — the cross-encoder then
+/// judges a snippet, which is worse but still ranked.
+fn hydrate_content(bm25: &Bm25Search, head: &mut [Candidate]) {
+    let missing: Vec<String> = head
+        .iter()
+        .filter(|c| c.content.is_none())
+        .map(|c| c.chunk_id.clone())
         .collect();
-
-    let mut final_results = head_results;
-    final_results.extend(tail_results);
-    Ok(final_results.into_iter().take(params.limit).collect())
+    if missing.is_empty() {
+        return;
+    }
+    match bm25.lookup_contents(&missing) {
+        Ok(map) => {
+            for c in head.iter_mut().filter(|c| c.content.is_none()) {
+                match map.get(&c.chunk_id) {
+                    Some(text) => c.content = Some(text.clone()),
+                    None => warn!(
+                        chunk_id = %c.chunk_id,
+                        file = %c.file,
+                        "no BM25 doc for chunk_id; reranker will see snippet only"
+                    ),
+                }
+            }
+        }
+        Err(e) => warn!(
+            missing = missing.len(),
+            error = %e,
+            "batch content lookup failed; reranker will see snippets only"
+        ),
+    }
 }
 
 struct Candidate {
@@ -597,5 +756,20 @@ mod tests {
         let rerank = [1.0, 1.0];
         let fused = fuse_rerank_votes(&rrf, &rerank, 60, 2.0);
         assert_eq!(ranking(&fused), vec![1, 0]);
+    }
+
+    #[test]
+    fn stage_steps_are_ordered_and_within_total() {
+        let stages = [
+            SearchStage::Embedding,
+            SearchStage::Retrieving,
+            SearchStage::Reranking,
+            SearchStage::Finalizing,
+        ];
+        for (i, s) in stages.iter().enumerate() {
+            assert_eq!(s.step(), i as u32 + 1);
+            assert!(s.step() <= SearchStage::TOTAL);
+            assert!(!s.label().is_empty());
+        }
     }
 }

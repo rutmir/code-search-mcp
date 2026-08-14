@@ -26,9 +26,11 @@ root = "."
 #                             "javascript" "go" "csharp" "java"
 #   structured-text:          "markdown" "toml" "yaml" "json" "xml"
 #   build / manifest config:  "gradle" "properties"   (Android/JVM projects)
+#   line-chunked languages:   "kotlin" "swift"        (no grammar wired up yet)
 #   plain-text bucket:        "shell" "systemd" "env" "text"
 # `xml` covers AndroidManifest.xml + res/values/*.xml; `gradle` covers
-# build.gradle / settings.gradle; `properties` covers gradle*.properties.
+# build.gradle / settings.gradle / build.gradle.kts; `properties` covers
+# gradle*.properties.
 # All three are line-chunked (no tree-sitter) — good enough for the small,
 # flat config files they target.
 # `text` is a catch-all for *.txt / *.local / *.example / *.ini / *.cfg /
