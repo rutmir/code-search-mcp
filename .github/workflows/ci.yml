@@ -76,10 +76,21 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # This job reports; it never writes back to the repo.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check dependencies for security advisories
-        uses: rustsec/audit-check@v2
+      # Deliberately not `rustsec/audit-check`: it publishes results through
+      # the Checks API, which needs `checks: write` and is unavailable to
+      # pull requests from forks — so it fails on permissions rather than on
+      # findings, which is the opposite of what a security job should do.
+      # A plain binary run reproduces exactly with `cargo audit` locally.
+      # Accepted advisories and their justification live in .cargo/audit.toml.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+
+      - name: cargo audit
+        run: cargo audit

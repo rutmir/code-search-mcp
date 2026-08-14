@@ -55,6 +55,10 @@ notify reports `mv src/ old_src/` as a single event on the directory and never m
 
 Test count 100 → 117. New: an integration test that drives the real binary over a pipe (handshake, both tool schemas, JSON-RPC error codes, and above all that stdout carries nothing but JSON-RPC — the one hard constraint no unit test can reach); collection-name derivation stability; a deterministic adversarial-UTF-8 sweep through the BM25 tokenizer, which slices by byte offset and would panic the indexer on a boundary mistake. CI gains a job pinned to the declared MSRV (1.88), previously an unverified assertion, and a `cargo audit` job.
 
+The audit job's first run found four advisories; three were closed by semver-compatible lockfile bumps (`crossbeam-epoch` 0.9.18 → 0.9.20, `memmap2` 0.9.10 → 0.9.11, `quinn-proto` 0.11.14 → 0.11.16 — the last being an optional `reqwest` dependency that is never compiled here but is still recorded in `Cargo.lock`), plus `anyhow` 1.0.102 → 1.0.104 for an unsoundness advisory. The fourth, RUSTSEC-2025-0009 in `ring` <0.17.12, is not fixable in isolation: `ring` 0.17.12 needs a `cc` newer than 1.0.x while `tree-sitter-javascript 0.21.4` declares `cc = "~1.0.90"`, and 0.21.4 is the newest release compatible with the tree-sitter 0.22 ABI. It's accepted in `.cargo/audit.toml` with that reasoning recorded, and is unblocked by a tree-sitter 0.23 upgrade. MSRV is unchanged by the bumps (still driven by `time` 0.3).
+
+The job runs `cargo audit` directly rather than through `rustsec/audit-check`, which publishes via the Checks API — that needs `checks: write` and is unavailable to fork pull requests, so it failed on permissions instead of on findings. A plain binary run reproduces exactly with `cargo audit` locally.
+
 ## 2026-07-08
 
 ### `[index].languages` is now optional — opt-out indexing by default
