@@ -28,7 +28,7 @@ One tool call returns ranked `file:line` chunks (~1500 tokens, structured with s
 
 Use Grep / Read / Bash directly only when:
 
-1. **Known specific path**: `Read docs/ROADMAP.md:42-50` — yes. `code_search "ROADMAP what does it say"` → then Read the resulting chunk — no, that's the right flow
+1. **Known specific path**: `Read docs/ROADMAP.md:42-50` — yes. `code_search "ROADMAP what does it say"` → then Read the resulting chunk — no, that's the right flow (and if you only need that one chunk, `code_read_chunk` beats `Read`: it returns the chunk's full text from the index without pulling in the rest of the file)
 2. **Exact-bytes operations**: hex dumps, log tails, line counts, diffs between files
 3. **Non-indexed content**: build artifacts, generated files, paths in `[index].exclude` or gitignored (`target/`, `build/`, `*.lock`, etc.)
 4. **Trivial shell / git operations**: `git log`, `git status`, `ls`, `wc -l` — cheaper than `code_search` and not about file content
@@ -44,8 +44,10 @@ Use Grep / Read / Bash directly only when:
    - one subdir:  code_search "..." {"path": "src/feature/"}
 4. Top-3-5 hits show where to look. Use kind/name anchors in headers
    (e.g. `fn Foo::bar`, `## Section Title`) to navigate
-5. If full file content needed → Read the specific file:line range
-6. If cross-references needed → another code_search with a different query
+5. Preview cut off mid-chunk?  → code_read_chunk with the file and the
+   line range from that hit's header — full text, no file read
+6. Need lines the chunk doesn't cover → Read the specific file:line range
+7. If cross-references needed → another code_search with a different query
 ```
 
 **Tip**: concise queries (3-10 words) outperform long descriptions. The reranker sees more signal in a tight phrase.

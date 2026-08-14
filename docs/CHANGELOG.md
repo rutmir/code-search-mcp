@@ -2,6 +2,59 @@
 
 History of significant changes. Newest at the top. Dates are when work landed locally; this project doesn't tag releases yet.
 
+## 2026-08-14
+
+**⚠ Upgrade note: the first `index` / `serve` start after this upgrade auto-clears and fully rebuilds the index** (BM25 schema revision 2 → 3 for the new stored AST fields; re-embeds the whole corpus — plan for first-index duration).
+
+### `lang` filter was only half-applied
+
+`code_search(query, lang="rust")` pushed the language restriction into Qdrant but not into tantivy, and nothing filtered the merged pool afterwards — so any BM25 hit in any other language survived the merge with a full RRF vote and could outrank the Rust chunk the caller asked for. The restriction is now a hard `Must` clause on the sparse side too, with a post-merge retain as insurance against a payload/schema disagreement.
+
+### `path` filter no longer starves the result set
+
+`path` is a substring match neither store expresses cheaply (Qdrant needs a full-text payload index and then matches *tokens*, not substrings; tantivy's `file` field is raw-tokenized), so it stays a post-retrieval filter. But it used to be applied to a fixed top-30+30 pool: scoping to `docs/` in a repo whose global top-30 happened to be code returned nothing at all. The pool is now widened 10× (capped at 500) whenever a `path` filter is set. Reranking still only sees `rerank_top_n` candidates, so the extra depth costs retrieval bandwidth, not cross-encoder time.
+
+### BM25 schema v3: AST metadata is stored and searched
+
+`kind` and `name` are now stored in tantivy, and `name` is indexed and searched alongside `content` at a 3× boost. Two consequences: a chunk that came in via BM25 alone now carries its own syntactic anchor (`fn Foo::bar`) instead of needing a separate Qdrant round trip per query to fill it in, and a query naming a symbol gets a genuine BM25 signal from the name field rather than relying entirely on the post-merge symbol boost.
+
+### Chunk-level vector reuse
+
+The sha cache is per-file, so editing one function used to re-embed every chunk in the file — 40 embeddings to change one. Chunks now carry a `chunk_sha` payload, and a file being *re*indexed first pulls its stored vectors keyed by that hash; only chunks whose text actually changed go to the embedding server. A chunk that merely shifted down the file matches by content and is reused as-is. Safe because `config_hard` covers the embedding model and dimensions — a model change clears the collection before any vector could be reused under a different model.
+
+### Per-query cost
+
+- `Bm25Search` holds one `IndexReader` for its lifetime instead of building one per call — and per `lookup_content` call, which meant up to 31 reader constructions (each registering a directory watch) in a single search. Content hydration for the rerank head is now one `TermSetQuery`.
+- New `SearchContext` owns the Qdrant, embedding and reranker clients plus the tantivy reader for the life of the process. `serve` builds one at startup, so a query no longer constructs a fresh `reqwest` client (new connection pool, new TLS handshake), re-pings the Qdrant root endpoint, or re-fetches the marker. It initializes lazily with retry, so the server still starts — and reports tool-level errors — when Qdrant is down or the index hasn't been built yet.
+- Keyword payload indexes are created for `file`, `lang` and `kind`. Every search carries a `must_not kind = marker` clause and often a `lang` restriction, and every reindex issues a `file`-filtered delete.
+
+### `code_read_chunk` MCP tool
+
+Search previews are capped at 600 chars, after which the model had to `Read` the file — spending back much of what the search saved. The new tool returns the untruncated text of the chunks at a `file:start-end` from a previous result, straight from the index, capped at 20k chars per call.
+
+### MCP: progress, version negotiation, cleaner shutdown
+
+- `notifications/progress` is emitted (embedding → retrieving → reranking → finalizing) when the client supplies a `_meta.progressToken`. A quality-first search can run for minutes with no other sign of life.
+- `initialize` now negotiates: the server echoes the client's `protocolVersion` when it speaks it (`2025-06-18`, `2025-03-26`, `2024-11-05`), otherwise offers its own. Advertised version moved from `2024-11-05` to `2025-06-18`.
+- On stdin EOF the loop used to return immediately, dropping the responses of any `tools/call` already dispatched. Shutdown now drains those responses, bounded by a 5-second grace period.
+- The in-flight cancellation registry recovers from a poisoned mutex instead of panicking on every subsequent `tools/call` for the life of the process.
+
+### `watch`: renamed and deleted directories
+
+notify reports `mv src/ old_src/` as a single event on the directory and never mentions its contents, so every chunk under it stayed in both stores until the next full `index` ran stale-detection. A path that no longer exists is now treated as a prefix over the file cache. The scan is gated on non-existence, so the noise path (build artifacts, ignored files) still costs one `stat`, not a walk of the cache.
+
+### New `status` subcommand
+
+`check` answers "are the services up". `status` answers "is my index current" — collection and point count, tantivy file count, per-file drift between the two stores in both directions, and every marker field compared against what the current config expects. Read-only, never fatal on a mismatch (reporting it is the point), and it reads tantivy through the read-only handle so it works while `serve` or `watch` holds the write lock.
+
+### Kotlin / Swift buckets
+
+`.kt` and `.swift` used to fall into the catch-all `text` bucket, so an Android or iOS project couldn't name its primary language in an `[index].languages` whitelist and `lang = "kotlin"` was not a usable search filter. Both now have their own bucket; `.kts` joins `gradle`, where build scripts belong. Still line-chunked — no tree-sitter grammar is wired up for them yet.
+
+### Tests and CI
+
+Test count 100 → 117. New: an integration test that drives the real binary over a pipe (handshake, both tool schemas, JSON-RPC error codes, and above all that stdout carries nothing but JSON-RPC — the one hard constraint no unit test can reach); collection-name derivation stability; a deterministic adversarial-UTF-8 sweep through the BM25 tokenizer, which slices by byte offset and would panic the indexer on a boundary mistake. CI gains a job pinned to the declared MSRV (1.88), previously an unverified assertion, and a `cargo audit` job.
+
 ## 2026-07-08
 
 ### `[index].languages` is now optional — opt-out indexing by default
