@@ -629,6 +629,107 @@ impl Client {
         }
         Ok(cache)
     }
+
+    /// Every stored vector for `file`, keyed by the chunk's content hash.
+    ///
+    /// Feeds the indexer's chunk-level reuse: when a file changes, most of
+    /// its chunks usually don't, and re-embedding them is the single most
+    /// expensive thing the watcher does. Keying on content hash (not chunk
+    /// id, which also encodes line numbers) means a chunk that merely
+    /// shifted down the file still matches.
+    ///
+    /// Safe because `config_hard` covers the embedding model and
+    /// dimensions: a model change clears the collection before any of
+    /// these vectors could be reused under the new model.
+    pub async fn fetch_file_vectors(&self, file: &str) -> Result<HashMap<String, Vec<f32>>> {
+        let url = format!(
+            "{}/collections/{}/points/scroll",
+            self.base_url, self.collection
+        );
+        let mut out: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut next_offset: Option<serde_json::Value> = None;
+        loop {
+            let body = serde_json::json!({
+                "limit": 256,
+                "filter": {
+                    "must": [ { "key": "file", "match": { "value": file } } ]
+                },
+                "with_payload": { "include": ["chunk_sha"] },
+                "with_vector": true,
+                "offset": next_offset,
+            });
+            let resp = self
+                .http
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .context("qdrant POST scroll (file vectors)")?
+                .error_for_status()
+                .context("qdrant scroll (file vectors) non-2xx")?;
+            let parsed: VectorScrollResp = resp
+                .json()
+                .await
+                .context("parsing scroll response (file vectors)")?;
+            for p in parsed.result.points {
+                // Points written before chunk_sha existed simply don't
+                // participate in reuse; they get re-embedded once and
+                // carry the field from then on.
+                if let (Some(sha), Some(vector)) = (p.payload.chunk_sha, p.vector) {
+                    out.insert(sha, vector);
+                }
+            }
+            match parsed.result.next_page_offset {
+                Some(v) if !v.is_null() => next_offset = Some(v),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Create keyword payload indexes for the fields we filter on.
+    ///
+    /// Every search carries a `must_not kind = marker` clause and often a
+    /// `lang` restriction, and every reindex of a changed file issues a
+    /// `file`-filtered delete. Without an index Qdrant has to consult the
+    /// payload of candidate points instead of resolving the filter from a
+    /// posting list, which degrades filtered HNSW search as the collection
+    /// grows.
+    ///
+    /// Best-effort: an index that already exists is a no-op, and a failure
+    /// here costs performance, not correctness, so it must never abort a
+    /// reindex.
+    pub async fn ensure_payload_indexes(&self) {
+        for field in ["file", "lang", "kind"] {
+            let url = format!(
+                "{}/collections/{}/index?wait=true",
+                self.base_url, self.collection
+            );
+            let body = serde_json::json!({
+                "field_name": field,
+                "field_schema": "keyword",
+            });
+            let result = self
+                .http
+                .put(&url)
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| format!("qdrant PUT index for {}", field))
+                .and_then(|r| {
+                    r.error_for_status()
+                        .with_context(|| format!("qdrant index {} non-2xx", field))
+                });
+            match result {
+                Ok(_) => tracing::debug!(field, "qdrant payload index ensured"),
+                Err(e) => tracing::warn!(
+                    field,
+                    error = %e,
+                    "could not create qdrant payload index; filtered search will be slower"
+                ),
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -654,6 +755,35 @@ struct ScrollPayload {
     file: Option<String>,
     #[serde(default)]
     file_sha256: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VectorScrollResp {
+    result: VectorScrollInner,
+}
+
+#[derive(Deserialize)]
+struct VectorScrollInner {
+    points: Vec<VectorScrollPoint>,
+    #[serde(default)]
+    next_page_offset: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct VectorScrollPoint {
+    #[serde(default)]
+    payload: ChunkShaPayload,
+    /// Absent when the collection stores named vectors; this project only
+    /// ever writes the default unnamed vector, so a missing value means
+    /// "nothing to reuse" rather than an error.
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+}
+
+#[derive(Deserialize, Default)]
+struct ChunkShaPayload {
+    #[serde(default)]
+    chunk_sha: Option<String>,
 }
 
 #[derive(Deserialize)]

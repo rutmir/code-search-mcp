@@ -136,6 +136,38 @@ pub async fn run(config: &Config) -> Result<()> {
     }
 }
 
+/// Which indexed files a non-indexable path event should remove.
+///
+/// The direct case is a tracked file that was deleted. The case that used
+/// to be missed: `mv src/ old_src/` (or `rm -rf src/`) reports the
+/// *directory*, and nothing ever reports its contents — so every chunk
+/// under it survived in both stores until the next full `index` ran its
+/// stale-detection pass. Treating a vanished path as a prefix over the
+/// cache closes that gap.
+///
+/// The prefix scan is gated on the path no longer existing, because this
+/// branch is also the hot path for pure noise (build artifacts, ignored
+/// files), and those must not cost a scan of the whole cache.
+fn vanished_files(
+    cache: &HashMap<PathBuf, String>,
+    absolute: &std::path::Path,
+    relative: &std::path::Path,
+) -> Vec<PathBuf> {
+    if cache.contains_key(relative) {
+        return vec![relative.to_path_buf()];
+    }
+    if absolute.exists() {
+        return Vec::new();
+    }
+    // `starts_with` is component-wise, so `src/foo` never matches
+    // `src/foobar`.
+    cache
+        .keys()
+        .filter(|p| p.starts_with(relative))
+        .cloned()
+        .collect()
+}
+
 /// Process one debounced batch. We deduplicate paths within the batch
 /// (a file may be touched multiple times during the debounce window) and
 /// classify each into either "process" (file currently exists & passes
@@ -215,30 +247,97 @@ async fn handle_batch(
                 // Either the path was deleted, was never indexable
                 // (wrong extension / gitignored / excluded), or is a
                 // directory event we don't care about. The only thing
-                // that needs action is the deletion case: if this path
-                // is in our cache, remove it.
+                // that needs action is the deletion case.
                 //
                 // We key the cache by the *relative* path; convert.
                 let relative = path
                     .strip_prefix(&config.project.root)
                     .unwrap_or(&path)
                     .to_path_buf();
-                if cache.contains_key(&relative) {
-                    match indexer::delete_file_from_indexes(vs, bm25, cache, &relative).await {
+                if relative.as_os_str().is_empty() {
+                    // An event on the project root itself. Treating it as a
+                    // prefix would wipe the entire index.
+                    continue;
+                }
+                for victim in vanished_files(cache, &path, &relative) {
+                    match indexer::delete_file_from_indexes(vs, bm25, cache, &victim).await {
                         Ok(()) => info!(
-                            file = %relative.display(),
+                            file = %victim.display(),
                             "watcher: removed (file deleted)"
                         ),
                         Err(e) => error!(
-                            file = %relative.display(),
+                            file = %victim.display(),
                             error = ?e,
                             "watcher: failed to remove deleted file from indexes"
                         ),
                     }
                 }
-                // Otherwise: a directory event, an irrelevant extension,
-                // or a noise event. Silently drop.
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_with(paths: &[&str]) -> HashMap<PathBuf, String> {
+        paths
+            .iter()
+            .map(|p| (PathBuf::from(p), "sha".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn tracked_file_is_removed_directly() {
+        let cache = cache_with(&["src/a.rs", "src/b.rs"]);
+        let got = vanished_files(
+            &cache,
+            std::path::Path::new("/nonexistent/src/a.rs"),
+            std::path::Path::new("src/a.rs"),
+        );
+        assert_eq!(got, vec![PathBuf::from("src/a.rs")]);
+    }
+
+    #[test]
+    fn vanished_directory_removes_everything_under_it() {
+        // notify reports `mv src/ old_src/` as one event on the directory;
+        // without prefix expansion its files would stay indexed forever.
+        let cache = cache_with(&["src/a.rs", "src/deep/b.rs", "docs/c.md"]);
+        let mut got = vanished_files(
+            &cache,
+            std::path::Path::new("/nonexistent/src"),
+            std::path::Path::new("src"),
+        );
+        got.sort();
+        assert_eq!(
+            got,
+            vec![PathBuf::from("src/a.rs"), PathBuf::from("src/deep/b.rs")]
+        );
+    }
+
+    #[test]
+    fn prefix_match_respects_path_components() {
+        // `src` must not swallow `srcgen/`.
+        let cache = cache_with(&["srcgen/a.rs"]);
+        let got = vanished_files(
+            &cache,
+            std::path::Path::new("/nonexistent/src"),
+            std::path::Path::new("src"),
+        );
+        assert!(
+            got.is_empty(),
+            "component-wise prefix expected, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn existing_but_unindexable_path_is_noise() {
+        // A build artifact that the filter rejected: it still exists, so no
+        // cache scan and nothing to delete.
+        let cache = cache_with(&["src/a.rs"]);
+        let here = std::path::Path::new(file!());
+        let got = vanished_files(&cache, here, std::path::Path::new("target"));
+        assert!(got.is_empty());
     }
 }

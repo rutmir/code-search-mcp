@@ -59,6 +59,7 @@ pub async fn run(config: &Config) -> Result<IndexStats> {
     )
     .await?;
     vs.ensure_collection(config.embedding.dimensions).await?;
+    vs.ensure_payload_indexes().await;
     // Marker-driven config-change handling. Project identity mismatch
     // already bails inside check_marker_status. The remaining cases:
     //   Fresh        — first run, write the marker
@@ -105,6 +106,7 @@ pub async fn run(config: &Config) -> Result<IndexStats> {
             }
             // Recreate from scratch and rewrite marker for the new state.
             vs.ensure_collection(config.embedding.dimensions).await?;
+            vs.ensure_payload_indexes().await;
             vs.write_current_marker(config, config.embedding.dimensions)
                 .await?;
             info!("auto-clear complete; proceeding with fresh index");
@@ -354,6 +356,26 @@ pub async fn process_one_file(
         }
     }
 
+    // The file is in the cache with a different sha: it's an edit, not a
+    // first index, so its old vectors are still in Qdrant and most of its
+    // chunks probably survived the edit unchanged. Fetch them before the
+    // delete below wipes them. A failure here only costs re-embedding.
+    let reusable: HashMap<String, Vec<f32>> = if cache.contains_key(&entry.relative) {
+        match vs.fetch_file_vectors(&rel_str).await {
+            Ok(map) => map,
+            Err(e) => {
+                warn!(
+                    file = %entry.relative.display(),
+                    error = %e,
+                    "could not fetch previous vectors; re-embedding the whole file"
+                );
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
     // Wipe any prior footprint of this file in both stores before reindexing.
     // Idempotent if the file has nothing yet (new/legacy).
     vs.delete_by_file(&rel_str).await?;
@@ -364,47 +386,74 @@ pub async fn process_one_file(
         return Ok(());
     }
 
-    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-    let total_chars: usize = texts.iter().map(|t| t.len()).sum();
-    // Logged BEFORE the embed call so the user can see which file is "stuck"
-    // on the GPU. Without this, a single 100+ KB file with many chunks looks
-    // like a multi-minute hang at INFO level (tantivy logs cover the *previous*
-    // file, not the one currently embedding).
-    info!(
-        file = %entry.relative.display(),
-        chunks = chunks.len(),
-        chars = total_chars,
-        budget = batcher.budget(),
-        "embedding file"
-    );
-    let embed_start = std::time::Instant::now();
-    let vectors_opt = embed_with_adaptive_batching(embedder, texts, batcher)
-        .await
-        .with_context(|| format!("embed for {}", entry.relative.display()))?;
-    let embed_ms = embed_start.elapsed().as_millis() as u64;
+    let chunk_shas: Vec<String> = chunks.iter().map(|c| sha256_hex(&c.text)).collect();
+    let mut vectors_opt: Vec<Option<Vec<f32>>> = vec![None; chunks.len()];
+    let mut embed_idx: Vec<usize> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    for (i, sha) in chunk_shas.iter().enumerate() {
+        match reusable.get(sha) {
+            Some(vector) => vectors_opt[i] = Some(vector.clone()),
+            None => {
+                embed_idx.push(i);
+                texts.push(chunks[i].text.clone());
+            }
+        }
+    }
+    let reused = chunks.len() - embed_idx.len();
 
-    if vectors_opt.len() != chunks.len() {
-        anyhow::bail!(
-            "adaptive batcher returned {} slots for {} chunks",
-            vectors_opt.len(),
-            chunks.len()
+    let embed_start = std::time::Instant::now();
+    if !texts.is_empty() {
+        let total_chars: usize = texts.iter().map(|t| t.len()).sum();
+        // Logged BEFORE the embed call so the user can see which file is "stuck"
+        // on the GPU. Without this, a single 100+ KB file with many chunks looks
+        // like a multi-minute hang at INFO level (tantivy logs cover the *previous*
+        // file, not the one currently embedding).
+        info!(
+            file = %entry.relative.display(),
+            chunks = chunks.len(),
+            embedding = texts.len(),
+            reused,
+            chars = total_chars,
+            budget = batcher.budget(),
+            "embedding file"
+        );
+        let embedded = embed_with_adaptive_batching(embedder, texts, batcher)
+            .await
+            .with_context(|| format!("embed for {}", entry.relative.display()))?;
+        if embedded.len() != embed_idx.len() {
+            anyhow::bail!(
+                "adaptive batcher returned {} slots for {} chunks",
+                embedded.len(),
+                embed_idx.len()
+            );
+        }
+        for (slot, vector) in embed_idx.iter().zip(embedded) {
+            vectors_opt[*slot] = vector;
+        }
+    } else {
+        debug!(
+            file = %entry.relative.display(),
+            chunks = chunks.len(),
+            "all chunks unchanged; reusing stored vectors"
         );
     }
+    let embed_ms = embed_start.elapsed().as_millis() as u64;
 
     let mut points = Vec::new();
     let mut skipped_in_file = 0usize;
-    for (chunk, vector_opt) in chunks.iter().zip(vectors_opt) {
+    for ((chunk, chunk_sha), vector_opt) in chunks.iter().zip(&chunk_shas).zip(vectors_opt) {
         let Some(vector) = vector_opt else {
             skipped_in_file += 1;
             continue;
         };
-        let id = chunk_uuid(&entry.relative, chunk);
+        let id = chunk_uuid(&entry.relative, chunk, chunk_sha);
         let snippet: String = chunk.text.chars().take(200).collect();
         // kind/name are populated by AST-aware chunkers (currently TreeSitter
         // for Rust). For other chunkers they're null in the payload.
         let payload = serde_json::json!({
             "file": rel_str,
             "file_sha256": file_sha,
+            "chunk_sha": chunk_sha,
             "start_line": chunk.start_line,
             "end_line": chunk.end_line,
             "lang": entry.language,
@@ -468,6 +517,7 @@ pub async fn process_one_file(
         info!(
             file = %entry.relative.display(),
             chunks = chunks.len(),
+            reused,
             embed_ms,
             "indexed file"
         );
@@ -632,13 +682,13 @@ fn sha256_hex(data: &str) -> String {
     hex::encode(h.finalize())
 }
 
-fn chunk_uuid(rel_path: &Path, chunk: &Chunk) -> String {
+fn chunk_uuid(rel_path: &Path, chunk: &Chunk, chunk_sha: &str) -> String {
     let name = format!(
         "{}|{}-{}|{}",
         rel_path.display(),
         chunk.start_line,
         chunk.end_line,
-        sha256_hex(&chunk.text)
+        chunk_sha
     );
     Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes()).to_string()
 }
