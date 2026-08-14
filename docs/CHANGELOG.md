@@ -2,7 +2,7 @@
 
 History of significant changes. Newest at the top. Dates are when work landed locally; this project doesn't tag releases yet.
 
-## 2026-08-14
+## 2026-08-14 — v0.0.5
 
 **⚠ Upgrade note: the first `index` / `serve` start after this upgrade auto-clears and fully rebuilds the index** (BM25 schema revision 2 → 3 for the new stored AST fields; re-embeds the whole corpus — plan for first-index duration).
 
