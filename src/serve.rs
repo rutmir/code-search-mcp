@@ -54,6 +54,11 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// into context by accident.
 const MAX_READ_CHUNK_CHARS: usize = 20_000;
 
+/// How long shutdown waits for calls dispatched before stdin closed. Long
+/// enough for anything already returning, short enough that a wedged
+/// search can't keep the process alive after its client is gone.
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Standard JSON-RPC 2.0 error codes. Listed in full so we can pick the
 /// closest one when reporting protocol-level failures; `ERR_INTERNAL` is
 /// kept around for future internal-error cases (e.g. JSON serialization
@@ -221,8 +226,8 @@ async fn serve_loop(config: &Config) -> Result<()> {
             }
             maybe_line = line_rx.recv() => {
                 let Some(trimmed) = maybe_line else {
-                    info!("stdin closed; shutting down");
-                    return Ok(());
+                    info!("stdin closed; draining in-flight responses");
+                    break;
                 };
                 debug!(line = %trimmed, "<- received");
 
@@ -290,6 +295,31 @@ async fn serve_loop(config: &Config) -> Result<()> {
             }
         }
     }
+
+    // Stdin is closed, but tasks spawned before that may still be running.
+    // Their sender clones are the only ones left once ours is dropped, so
+    // `recv` returns None exactly when the last one finishes — no polling,
+    // no guessing. The client's read end is usually still open, and a
+    // dropped response is indistinguishable from a hung tool.
+    drop(resp_tx);
+    let drain = tokio::time::timeout(SHUTDOWN_DRAIN, async {
+        let mut sent = 0usize;
+        while let Some(response) = resp_rx.recv().await {
+            send(&mut stdout, &response).await?;
+            sent += 1;
+        }
+        Ok::<usize, anyhow::Error>(sent)
+    })
+    .await;
+    match drain {
+        Ok(Ok(sent)) => info!(drained = sent, "shutdown complete"),
+        Ok(Err(e)) => warn!(error = %e, "failed to write a response while draining"),
+        Err(_) => warn!(
+            timeout_s = SHUTDOWN_DRAIN.as_secs(),
+            "gave up waiting for in-flight calls; exiting"
+        ),
+    }
+    Ok(())
 }
 
 /// Spawn a `tools/call` task: registers a oneshot cancel sender keyed by

@@ -296,8 +296,15 @@ fn extensions_for_language(lang: &str) -> &'static [&'static str] {
         // `xml` (above) covers AndroidManifest.xml and res/values/*.xml;
         // `gradle` covers build.gradle / settings.gradle (Groovy DSL);
         // `properties` covers gradle.properties / gradle-wrapper.properties.
-        "gradle" => &["gradle"],
+        "gradle" => &["gradle", "kts"],
         "properties" => &["properties"],
+        // Kotlin and Swift have no tree-sitter grammar wired up yet, so
+        // they're line-chunked. They still get their own bucket rather
+        // than falling into `text`: an Android or iOS project must be able
+        // to name its primary language in an `[index].languages`
+        // whitelist, and `lang = "kotlin"` must be a usable search filter.
+        "kotlin" => &["kt"],
+        "swift" => &["swift"],
         // Plain-text-ish formats. No tree-sitter for these — the line
         // chunker (the default fallback) handles them well because they
         // tend to be small and have flat structure.
@@ -333,8 +340,13 @@ fn language_from_ext(ext: &str) -> String {
         "yaml" | "yml" => "yaml",
         "json" => "json",
         "xml" => "xml",
-        "gradle" => "gradle",
+        // `.kts` is a Kotlin script, but in practice it is nearly always
+        // build.gradle.kts — grouping it with `gradle` keeps a project's
+        // build config in one filterable bucket.
+        "gradle" | "kts" => "gradle",
         "properties" => "properties",
+        "kt" => "kotlin",
+        "swift" => "swift",
         "sh" | "bash" | "zsh" => "shell",
         "service" | "socket" | "timer" | "mount" | "target" | "path" => "systemd",
         "env" => "env",
@@ -393,8 +405,54 @@ mod tests {
         assert_eq!(language_from_ext("xml"), "xml");
         assert_eq!(language_from_ext("gradle"), "gradle");
         assert_eq!(language_from_ext("properties"), "properties");
+        assert_eq!(language_from_ext("kt"), "kotlin");
+        assert_eq!(language_from_ext("swift"), "swift");
+        // Kotlin build scripts belong with the rest of the build config.
+        assert_eq!(language_from_ext("kts"), "gradle");
         // Unknown text extension falls through to the line-chunked `text` bucket.
-        assert_eq!(language_from_ext("kt"), "text");
+        assert_eq!(language_from_ext("scala"), "text");
+    }
+
+    /// Every bucket `extensions_for_language` can name must map back to
+    /// itself, or an `[index].languages` whitelist would admit a file and
+    /// then tag it with a language the user never asked for — which the
+    /// `lang` search filter would then never match.
+    #[test]
+    fn whitelist_extensions_round_trip_to_their_language() {
+        for lang in [
+            "rust",
+            "python",
+            "cpp",
+            "typescript",
+            "javascript",
+            "go",
+            "csharp",
+            "java",
+            "toml",
+            "markdown",
+            "dart",
+            "yaml",
+            "json",
+            "xml",
+            "gradle",
+            "properties",
+            "kotlin",
+            "swift",
+            "shell",
+            "systemd",
+            "env",
+            "text",
+        ] {
+            let exts = extensions_for_language(lang);
+            assert!(!exts.is_empty(), "{lang} has no extensions");
+            for ext in exts {
+                assert_eq!(
+                    language_from_ext(ext),
+                    lang,
+                    "extension {ext:?} is listed under {lang:?} but maps elsewhere"
+                );
+            }
+        }
     }
 
     #[test]

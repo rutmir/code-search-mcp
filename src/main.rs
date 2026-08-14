@@ -32,6 +32,10 @@ struct Cli {
 enum Command {
     /// Validate config, ping configured services, verify embedding dimensions match
     Check,
+    /// Report what is currently indexed: collection, point count, tantivy
+    /// file count, drift between the two stores, and the marker's state.
+    /// Read-only — touches neither store's contents.
+    Status,
     /// Walk the project, (re)index changed files, sync Qdrant + tantivy + state.json
     Index,
     /// Hybrid search: dense (Qdrant) ∪ sparse (BM25) → RRF merge → optional rerank.
@@ -61,8 +65,8 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Run as an MCP server over stdio. Exposes a single tool
-    /// `code_search`. Used by Claude Code via `.mcp.json` at the
+    /// Run as an MCP server over stdio. Exposes `code_search` and
+    /// `code_read_chunk`. Used by Claude Code via `.mcp.json` at the
     /// project root.
     Serve,
     /// Watch the project tree and incrementally reindex on file changes.
@@ -87,6 +91,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Check => run_check(&config).await,
+        Command::Status => run_status(&config).await,
         Command::Index => run_index(&config).await,
         Command::Search {
             query,
@@ -302,6 +307,106 @@ async fn run_clear(config: &Config, yes: bool) -> Result<()> {
 
     info!("clear complete — next `index` will rebuild from scratch");
     Ok(())
+}
+
+/// Report what's actually in the two stores.
+///
+/// Unlike `check` (which pings the services and validates the config),
+/// this answers "is my index current, and do the two halves agree?" — the
+/// question you have when search results feel stale. Read-only, and it
+/// deliberately never bails on a marker mismatch: reporting the mismatch
+/// IS the output.
+///
+/// Costs one full Qdrant scroll, since per-file drift can't be derived
+/// from the collection's point count alone.
+async fn run_status(config: &Config) -> Result<()> {
+    let vs = vector_store::Client::new(
+        &config.vector_store,
+        config.vector_store.resolve_collection_name(&config.project),
+    )
+    .await?;
+
+    println!("project      {}", config.project.id);
+    println!("root         {}", config.project.root.display());
+    println!("collection   {}", vs.collection_name());
+
+    if !vs.collection_exists().await? {
+        println!("qdrant       collection does not exist — run `index`");
+        return Ok(());
+    }
+    println!("qdrant       {} points", vs.points_count().await?);
+
+    // Marker: report every field against what this config expects.
+    let expected = vector_store::MarkerPayload::for_config(config);
+    match vs.fetch_marker().await? {
+        None => println!("marker       absent (fresh or pre-marker collection)"),
+        Some(m) => {
+            println!(
+                "marker       written by v{} on {} ({}@{})",
+                m.version.as_deref().unwrap_or("?"),
+                m.created_at.as_deref().unwrap_or("?"),
+                m.user.as_deref().unwrap_or("?"),
+                m.host.as_deref().unwrap_or("?"),
+            );
+            println!(
+                "  identity   {}",
+                verdict(m.fingerprint == expected.fingerprint, "another project!")
+            );
+            println!(
+                "  config     hard: {}   soft: {}",
+                verdict(
+                    m.config_hard == expected.config_hard,
+                    "changed — `index` will auto-clear and rebuild"
+                ),
+                verdict(
+                    m.config_soft == expected.config_soft,
+                    "changed — run `index`"
+                ),
+            );
+        }
+    }
+
+    // Per-file drift between the stores. The indexer intersects them, so a
+    // one-sided file is silently unsearchable in one modality until the
+    // next `index`.
+    let qdrant_files: std::collections::HashSet<PathBuf> =
+        vs.scroll_files().await?.into_keys().collect();
+    println!("qdrant files {}", qdrant_files.len());
+
+    if !config.bm25.index_path.exists() {
+        println!(
+            "tantivy      {} — not built yet",
+            config.bm25.index_path.display()
+        );
+        return Ok(());
+    }
+    let bm25 = bm25::Bm25Search::open(&config.bm25.index_path)?;
+    let tantivy_files = bm25.list_indexed_files()?;
+    println!(
+        "tantivy      {} — {} files",
+        config.bm25.index_path.display(),
+        tantivy_files.len()
+    );
+
+    let missing_locally = qdrant_files.difference(&tantivy_files).count();
+    let missing_remotely = tantivy_files.difference(&qdrant_files).count();
+    if missing_locally == 0 && missing_remotely == 0 {
+        println!("drift        none — both stores agree");
+    } else {
+        println!(
+            "drift        {} file(s) in Qdrant but not tantivy, {} the other way — run `index`",
+            missing_locally, missing_remotely
+        );
+    }
+    Ok(())
+}
+
+fn verdict(ok: bool, complaint: &str) -> String {
+    if ok {
+        "match".to_string()
+    } else {
+        format!("MISMATCH ({})", complaint)
+    }
 }
 
 async fn run_check(config: &Config) -> Result<()> {

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use tantivy::{
     collector::TopDocs,
     query::{BooleanQuery, Occur, Query, QueryParser, TermQuery, TermSetQuery},
@@ -155,28 +155,34 @@ impl Bm25Index {
     /// machine that shares Qdrant but has an empty local tantivy
     /// directory) so we can reprocess those files and refill tantivy
     /// without trusting the otherwise-misleading cache.
-    pub fn list_indexed_files(&self) -> Result<std::collections::HashSet<std::path::PathBuf>> {
-        use std::collections::HashSet;
-        use std::path::PathBuf;
+    pub fn list_indexed_files(&self) -> Result<HashSet<PathBuf>> {
         let reader = self
             .index
             .reader()
             .context("creating tantivy reader for file enumeration")?;
-        let searcher = reader.searcher();
-        let mut out: HashSet<PathBuf> = HashSet::new();
-        for seg in searcher.segment_readers() {
-            let inv = seg
-                .inverted_index(self.fields.file)
-                .context("inverted_index(file)")?;
-            let mut terms = inv.terms().stream().context("terms stream")?;
-            while let Some((term_bytes, _info)) = terms.next() {
-                if let Ok(s) = std::str::from_utf8(term_bytes) {
-                    out.insert(PathBuf::from(s));
-                }
+        list_files(&reader, self.fields.file)
+    }
+}
+
+/// Distinct `file` terms across every segment. Shared by the writer-side
+/// [`Bm25Index`] and the read-only [`Bm25Search`] so `status` can inspect
+/// the index without taking the directory's write lock (which a running
+/// `serve` or `watch` already holds).
+fn list_files(reader: &IndexReader, file_field: Field) -> Result<HashSet<PathBuf>> {
+    let searcher = reader.searcher();
+    let mut out: HashSet<PathBuf> = HashSet::new();
+    for seg in searcher.segment_readers() {
+        let inv = seg
+            .inverted_index(file_field)
+            .context("inverted_index(file)")?;
+        let mut terms = inv.terms().stream().context("terms stream")?;
+        while let Some((term_bytes, _info)) = terms.next() {
+            if let Ok(s) = std::str::from_utf8(term_bytes) {
+                out.insert(PathBuf::from(s));
             }
         }
-        Ok(out)
     }
+    Ok(out)
 }
 
 fn build_schema() -> (Schema, SchemaFields) {
@@ -506,6 +512,13 @@ impl Bm25Search {
         Ok(out)
     }
 
+    /// Distinct file paths present in the index — the read-only twin of
+    /// [`Bm25Index::list_indexed_files`], for inspecting an index that a
+    /// running `serve` or `watch` holds the write lock on.
+    pub fn list_indexed_files(&self) -> Result<HashSet<PathBuf>> {
+        list_files(&self.reader, self.fields.file)
+    }
+
     /// Fetch every indexed chunk of `file` that overlaps the inclusive line
     /// range `[start, end]`, ordered by start line. Backs the
     /// `code_read_chunk` tool: the caller has a `file:start-end` header
@@ -631,6 +644,77 @@ mod tests {
     fn tok_underscore_runs_and_empties() {
         assert_eq!(tokens("__init__"), vec!["init"]);
         assert_eq!(tokens("____"), Vec::<String>::new());
+    }
+
+    /// The tokenizer indexes whatever bytes a repo happens to contain —
+    /// minified bundles, fixtures full of emoji, combining marks in
+    /// comments. It slices `text` by byte offsets computed from
+    /// `char_indices`, so a boundary mistake is a panic in the indexer,
+    /// not a bad search result. Sweep a pool of adversarial characters and
+    /// assert the invariants every emitted token must satisfy.
+    #[test]
+    fn tok_never_panics_and_emits_valid_offsets() {
+        const PIECES: &[&str] = &[
+            "_",
+            "A",
+            "a",
+            "9",
+            "Ж",
+            "ß",
+            "İ",
+            "ﬀ",
+            "🚀",
+            "👩‍💻",
+            "é",
+            "e\u{0301}",
+            "　",
+            "\u{200b}",
+            "::",
+            ".",
+            "-",
+            "\n",
+            "\t",
+            "\u{feff}",
+            "ｆｕｌｌ",
+            "𝔘",
+            "ᾈ",
+        ];
+        // Deterministic LCG — a fixed sweep beats a flaky random one.
+        let mut seed: u64 = 0x5eed_1234_dead_beef;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 33) as usize
+        };
+        for _ in 0..2_000 {
+            let len = next() % 12;
+            let text: String = (0..len).map(|_| PIECES[next() % PIECES.len()]).collect();
+
+            let mut t = CodeTokenizer;
+            let mut stream = t.token_stream(&text);
+            let mut prev_position = None;
+            while stream.advance() {
+                let tok = stream.token();
+                assert!(
+                    tok.offset_from < tok.offset_to,
+                    "empty span {}..{} in {text:?}",
+                    tok.offset_from,
+                    tok.offset_to
+                );
+                assert!(
+                    tok.offset_to <= text.len(),
+                    "span past end in {text:?}: {}..{}",
+                    tok.offset_from,
+                    tok.offset_to
+                );
+                // Panics unless both offsets land on char boundaries.
+                let slice = &text[tok.offset_from..tok.offset_to];
+                assert_eq!(tok.text, slice.to_lowercase());
+                if let Some(prev) = prev_position {
+                    assert!(tok.position > prev, "positions must strictly increase");
+                }
+                prev_position = Some(tok.position);
+            }
+        }
     }
 
     #[test]

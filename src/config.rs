@@ -353,3 +353,76 @@ fn expand_path(p: &Path) -> Result<PathBuf> {
         .into_owned();
     Ok(PathBuf::from(expanded))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project(id: &str, root: &str) -> ProjectConfig {
+        ProjectConfig {
+            id: id.to_string(),
+            root: PathBuf::from(root),
+        }
+    }
+
+    fn store(collection: Option<&str>) -> VectorStoreConfig {
+        VectorStoreConfig {
+            provider: "qdrant".to_string(),
+            url: "http://localhost:6333".to_string(),
+            collection: collection.map(str::to_string),
+            timeout_secs: 60,
+        }
+    }
+
+    /// The derived name is the only thing keeping two checkouts from
+    /// sharing a collection, and a change to it silently orphans every
+    /// existing index. It must be stable and it must separate.
+    #[test]
+    fn derived_collection_name_is_stable_and_separating() {
+        let a = derive_collection_name(&project("roex", "/home/u/proj"));
+        assert_eq!(a, derive_collection_name(&project("roex", "/home/u/proj")));
+        // Same project name, different checkout — must not collide.
+        assert_ne!(a, derive_collection_name(&project("roex", "/home/u/proj2")));
+        // Same path, renamed project — must not collide either.
+        assert_ne!(a, derive_collection_name(&project("roex2", "/home/u/proj")));
+    }
+
+    #[test]
+    fn derived_collection_name_is_qdrant_safe() {
+        let name = derive_collection_name(&project("Ω my proj/v2!", "/tmp/x"));
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "unsafe collection name: {name}"
+        );
+        // Ends in the 8-hex discriminator.
+        let suffix = name.rsplit('_').next().unwrap();
+        assert_eq!(suffix.len(), 8);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn slugify_collapses_unsafe_runs() {
+        assert_eq!(slugify_for_qdrant("plain-name_1"), "plain-name_1");
+        assert_eq!(slugify_for_qdrant("a  //  b"), "a_b");
+        assert_eq!(slugify_for_qdrant("привет"), "_");
+    }
+
+    #[test]
+    fn explicit_collection_overrides_derivation() {
+        let p = project("roex", "/home/u/proj");
+        assert_eq!(
+            store(Some("legacy_name")).resolve_collection_name(&p),
+            "legacy_name"
+        );
+        // A blank override is a config accident, not a request for a
+        // collection named "  " — fall back to the derived name.
+        for blank in [Some(""), Some("   "), None] {
+            assert_eq!(
+                store(blank).resolve_collection_name(&p),
+                derive_collection_name(&p),
+                "blank override {blank:?} should fall back"
+            );
+        }
+    }
+}
