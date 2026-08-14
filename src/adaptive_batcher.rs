@@ -10,6 +10,14 @@
 //!      - On any failure, ÷2 (multiplicative decrease).
 //!      - Bounded by [`MIN_BUDGET`, `MAX_BUDGET`].
 //!
+//!    A failure also arms a one-shot **retry ceiling** at half the size of
+//!    the batch that actually failed. Halving the budget alone does not
+//!    guarantee a smaller retry: a batch under the *new* budget packs
+//!    identically, so the same request goes out again and burns another
+//!    full timeout before anything changes. The ceiling makes every retry
+//!    strictly smaller; it is cleared by the next success so the budget
+//!    remains the thing that carries learned capacity between files.
+//!
 //! 2. **Per-request timeout**, derived from observed throughput. After each
 //!    success we record `chars_per_sec` (EWMA). Future timeouts are
 //!    `base + safety × (batch_chars / chars_per_sec)` — never need a
@@ -69,6 +77,10 @@ pub struct AdaptiveBatcher {
     /// None until the first measurement; bootstrap uses
     /// [`BOOTSTRAP_CHARS_PER_SEC`] in that case.
     chars_per_sec: Option<f64>,
+    /// Armed by [`note_failure`] at half the failing batch's size, cleared
+    /// by the next success. Caps [`pack`] in addition to the budget, which
+    /// is what makes a retry strictly smaller than what just failed.
+    retry_ceiling: Option<usize>,
 }
 
 impl AdaptiveBatcher {
@@ -77,11 +89,28 @@ impl AdaptiveBatcher {
             budget: initial.clamp(MIN_BUDGET, MAX_BUDGET),
             consecutive_ok: 0,
             chars_per_sec: None,
+            retry_ceiling: None,
         }
     }
 
     pub fn budget(&self) -> usize {
         self.budget
+    }
+
+    /// Ceiling in force for the next batch, when a failure has armed one.
+    /// Exposed so the caller can log why a retry is smaller than the budget
+    /// would suggest.
+    pub fn retry_ceiling(&self) -> Option<usize> {
+        self.retry_ceiling
+    }
+
+    /// Chars the next batch may occupy: the budget, further capped by any
+    /// armed retry ceiling.
+    fn pack_limit(&self) -> usize {
+        match self.retry_ceiling {
+            Some(ceiling) => self.budget.min(ceiling),
+            None => self.budget,
+        }
     }
 
     /// Observed throughput (chars/sec), if at least one batch has succeeded.
@@ -103,14 +132,15 @@ impl AdaptiveBatcher {
 
     /// Pick the next batch from `texts[start..]`, returning the exclusive
     /// end index. Always includes at least one element so progress is
-    /// guaranteed even when a single chunk exceeds the current budget
+    /// guaranteed even when a single chunk exceeds the current limit
     /// (the caller's failure path then skips it).
     pub fn pack(&self, texts: &[String], start: usize) -> usize {
+        let limit = self.pack_limit();
         let mut end = start;
         let mut total = 0usize;
         while end < texts.len() {
             let len = texts[end].len();
-            if end > start && total + len > self.budget {
+            if end > start && total + len > limit {
                 break;
             }
             total += len;
@@ -123,6 +153,11 @@ impl AdaptiveBatcher {
     /// future timeout estimates) and the AIMD success counter (which grows
     /// the budget after [`INCREASE_THRESHOLD`] in a row).
     pub fn note_success(&mut self, batch_chars: usize, elapsed: Duration) {
+        // The retry ceiling exists only to force the *next* attempt smaller
+        // after a failure; once something goes through, the budget is once
+        // again the sole authority on batch size.
+        self.retry_ceiling = None;
+
         // Throughput update — guard against div-by-zero on tiny batches.
         let secs = elapsed.as_secs_f64().max(0.001);
         let observed = batch_chars as f64 / secs;
@@ -144,11 +179,29 @@ impl AdaptiveBatcher {
         }
     }
 
-    /// Halve the budget on failure. Returns the new budget. Will not go
-    /// below [`MIN_BUDGET`] — at the floor, the caller treats the input as
-    /// unembeddable.
-    pub fn note_failure(&mut self) -> usize {
+    /// Record a failed batch of `failed_batch_chars`: halve the budget and
+    /// arm a retry ceiling at half the failing size. Returns the new budget.
+    ///
+    /// Both are needed. The budget is the long-lived estimate of server
+    /// capacity and must survive into the next file; the ceiling is what
+    /// guarantees the *immediate* retry is smaller. Without it, a batch that
+    /// already fit under the halved budget repacks identically and the same
+    /// request is re-sent — paying another full timeout to learn nothing.
+    ///
+    /// The budget will not go below [`MIN_BUDGET`]; at the floor the caller
+    /// treats a single oversized chunk as unembeddable.
+    pub fn note_failure(&mut self, failed_batch_chars: usize) -> usize {
         self.consecutive_ok = 0;
+        // At least 1: a ceiling of 0 would be meaningless, and `pack` always
+        // takes one element regardless.
+        let ceiling = (failed_batch_chars / 2).max(1);
+        self.retry_ceiling = Some(match self.retry_ceiling {
+            // Repeated failures keep tightening rather than resetting to a
+            // value derived from the (already smaller) latest attempt.
+            Some(prev) => prev.min(ceiling),
+            None => ceiling,
+        });
+
         let old = self.budget;
         let new = (self.budget / 2).max(MIN_BUDGET);
         if new < old {
@@ -243,15 +296,102 @@ mod tests {
     #[test]
     fn halve_on_failure() {
         let mut b = AdaptiveBatcher::new(10_000);
-        b.note_failure();
+        b.note_failure(10_000);
         assert_eq!(b.budget(), 5_000);
     }
 
     #[test]
     fn halve_floors_at_min() {
         let mut b = AdaptiveBatcher::new(MIN_BUDGET);
-        b.note_failure();
+        b.note_failure(MIN_BUDGET);
         assert_eq!(b.budget(), MIN_BUDGET);
+    }
+
+    /// The regression this whole mechanism exists for. A batch that fits
+    /// comfortably under the *halved* budget used to repack identically,
+    /// so the retry re-sent the same request and waited out another full
+    /// timeout before anything changed. Observed in the field: 17 chunks /
+    /// 118 075 chars failed at budget 256 000, halved to 128 000, and the
+    /// identical 17-chunk batch went out again.
+    #[test]
+    fn retry_after_failure_is_strictly_smaller() {
+        let chunk = 7_000;
+        let texts: Vec<String> = (0..17).map(|_| "x".repeat(chunk)).collect();
+        let mut b = AdaptiveBatcher::new(256_000);
+
+        let end = b.pack(&texts, 0);
+        assert_eq!(end, 17, "all chunks fit the initial budget");
+        let failed_chars: usize = texts[..end].iter().map(|t| t.len()).sum();
+        assert!(
+            failed_chars < 128_000,
+            "precondition: the failing batch fits under the halved budget"
+        );
+
+        b.note_failure(failed_chars);
+        let retry_end = b.pack(&texts, 0);
+        assert!(
+            retry_end < end,
+            "retry must be smaller: got {retry_end} chunks, was {end}"
+        );
+        let retry_chars: usize = texts[..retry_end].iter().map(|t| t.len()).sum();
+        assert!(
+            retry_chars <= failed_chars / 2,
+            "retry {retry_chars} should be at most half of {failed_chars}"
+        );
+    }
+
+    /// Repeated failures must keep converging, never widen back out.
+    #[test]
+    fn repeated_failures_keep_shrinking() {
+        let texts: Vec<String> = (0..64).map(|_| "x".repeat(4_000)).collect();
+        let mut b = AdaptiveBatcher::new(MAX_BUDGET);
+
+        let mut prev = b.pack(&texts, 0);
+        for round in 0..6 {
+            let chars: usize = texts[..prev].iter().map(|t| t.len()).sum();
+            b.note_failure(chars);
+            let next = b.pack(&texts, 0);
+            assert!(
+                next <= prev,
+                "round {round}: batch grew from {prev} to {next}"
+            );
+            if prev > 1 {
+                assert!(next < prev, "round {round}: batch stalled at {prev}");
+            }
+            prev = next;
+        }
+        // Converges to the single-chunk case the caller handles by skipping.
+        assert_eq!(prev, 1);
+    }
+
+    /// Progress is still guaranteed when even one chunk is over the ceiling —
+    /// `pack` must hand the caller that chunk so it can be skipped, not
+    /// return an empty batch and stall the loop.
+    #[test]
+    fn pack_advances_even_under_a_tight_ceiling() {
+        let texts = vec!["x".repeat(50_000), "y".repeat(50_000)];
+        let mut b = AdaptiveBatcher::new(MAX_BUDGET);
+        b.note_failure(100);
+        assert_eq!(b.pack(&texts, 0), 1);
+    }
+
+    /// The ceiling is a one-shot brake, not a permanent cap: once a batch
+    /// succeeds the budget is again the only limit, so throughput can
+    /// recover after a transient failure.
+    #[test]
+    fn success_clears_the_retry_ceiling() {
+        let texts: Vec<String> = (0..10).map(|_| "x".repeat(5_000)).collect();
+        let mut b = AdaptiveBatcher::new(MAX_BUDGET);
+
+        b.note_failure(50_000);
+        assert!(b.retry_ceiling().is_some());
+        let constrained = b.pack(&texts, 0);
+        assert!(constrained < 10);
+
+        b.note_success(constrained * 5_000, Duration::from_secs(1));
+        assert!(b.retry_ceiling().is_none());
+        // Budget was halved twice over from MAX but still admits all ten.
+        assert_eq!(b.pack(&texts, 0), 10);
     }
 
     #[test]

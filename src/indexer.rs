@@ -617,17 +617,19 @@ async fn embed_with_adaptive_batching(
                     }
                     ErrorClass::WorkloadTooBig => {
                         if end - start > 1 {
-                            // Multi-chunk: halve budget; next iteration packs
-                            // a smaller batch from the same start.
+                            // Multi-chunk: halve budget and cap the retry by
+                            // the failing batch, so the next pack from the
+                            // same start is strictly smaller.
                             let old = batcher.budget();
-                            let new = batcher.note_failure();
+                            let new = batcher.note_failure(batch_chars);
                             warn!(
                                 batch_size = end - start,
                                 batch_chars,
                                 old_budget = old,
                                 new_budget = new,
+                                retry_ceiling = ?batcher.retry_ceiling(),
                                 error = %embedding::short_err(&e),
-                                "batch too large for server; halving budget and retrying"
+                                "batch too large for server; shrinking and retrying"
                             );
                         } else {
                             // Single chunk too big — halving doesn't help.
@@ -648,11 +650,14 @@ async fn embed_with_adaptive_batching(
                     ErrorClass::PermanentBad => {
                         if end - start > 1 {
                             // Multi-chunk with a 4xx: somewhere in this batch
-                            // is bad input. Halve to bisect.
-                            let new = batcher.note_failure();
+                            // is bad input. Shrink to bisect — the ceiling is
+                            // what makes each pass actually narrow the search.
+                            let new = batcher.note_failure(batch_chars);
                             warn!(
                                 batch_size = end - start,
+                                batch_chars,
                                 new_budget = new,
+                                retry_ceiling = ?batcher.retry_ceiling(),
                                 error = %embedding::short_err(&e),
                                 "batch rejected as bad input; bisecting"
                             );
