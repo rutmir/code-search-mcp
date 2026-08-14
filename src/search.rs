@@ -187,8 +187,15 @@ impl SearchContext {
     }
 
     fn bm25(&self) -> Result<Arc<Bm25Search>> {
-        if let Some(existing) = self.bm25_slot().as_ref() {
-            return Ok(Arc::clone(existing));
+        // The lock is taken and released twice on purpose: `Bm25Search::open`
+        // does file I/O, and holding a std Mutex across it would serialize
+        // every concurrent query behind one open. Two threads racing here
+        // both get a valid handle; one of them simply wins the cache slot.
+        {
+            let slot = self.bm25_slot();
+            if let Some(existing) = slot.as_ref() {
+                return Ok(Arc::clone(existing));
+            }
         }
         let opened = Arc::new(Bm25Search::open(&self.config.bm25.index_path)?);
         *self.bm25_slot() = Some(Arc::clone(&opened));
