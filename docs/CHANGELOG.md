@@ -2,6 +2,31 @@
 
 History of significant changes. Newest at the top. Dates are when work landed locally; this project doesn't tag releases yet.
 
+## 2026-08-15 — v0.0.7
+
+### The cross-encoder is skipped for bare symbol lookups
+
+A query that is nothing but an identifier — `AdaptiveBatcher::note_failure`, `build_si_portfolio`, `SignalArbiter` — gains nothing from reranking. Measured on two corpora (648 and 6702 chunks): MRR 0.967 and recall@10 1.000 with the cross-encoder on *and* off, identical to four decimal places. On a CPU-bound host that was tens of seconds spent to change nothing.
+
+Such a query now skips the cross-encoder, on two conditions that both have to hold: the query consists solely of identifier-like tokens (so a question that merely mentions a symbol still gets reranked — that case was never measured), and retrieval has already placed the named symbol first (so we only skip when there is visibly nothing left to fix).
+
+Verified against the saved baseline on the 6702-chunk project:
+
+| | before | after |
+|---|---|---|
+| MRR, recall@1/3/5/10, symbol hit rate | — | **identical to 4 dp** |
+| median latency, `symbol` queries | 32.6 s | **0.19 s** |
+| median latency, whole set | 42.3 s | 27.3 s |
+| total time for 35 queries | 1676 s | 1128 s |
+
+No query's correct answer moved rank. Ten symbol queries reshuffled positions 2–3, which is what dropping the reranker's vote does, and those positions were not better before.
+
+No new configuration: the decision comes from the shape of the query, so it behaves the same on a slow host and a fast one.
+
+### `code_search` no longer cries wolf about the reranker
+
+The MCP tool output warned "reranker unavailable — results are RRF-ranked only" whenever no hit carried a rerank score. That could not distinguish a dead cross-encoder from one deliberately skipped, and a model taught to discount false warnings will discount the real one too. Search now reports a `RerankOutcome` (`Applied` / `NotRequested` / `SkippedSymbolQuery` / `Failed`) alongside its results, and only `Failed` produces the warning.
+
 ## 2026-08-15
 
 ### Query-language advice was backwards for non-English documentation

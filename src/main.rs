@@ -128,7 +128,7 @@ async fn run_search(
     json_out: bool,
 ) -> Result<()> {
     let started = std::time::Instant::now();
-    let results = search::run(
+    let outcome = search::run(
         config,
         search::SearchParams {
             query,
@@ -141,6 +141,7 @@ async fn run_search(
     )
     .await?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
+    let results = outcome.results;
 
     if json_out {
         // Compact JSON for piping into other tools.
