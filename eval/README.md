@@ -20,6 +20,12 @@ host, at a given latency budget. So the report separates two kinds of number:
 Needs a built binary and an **already-indexed** project — the harness only
 queries, it never indexes.
 
+Rebuild right before a long run. `cargo clippy --release` writes check-only
+metadata into the same profile directory and takes the executable with it, so
+a lint pass between the build and the run leaves `run.py` spawning a binary
+that no longer exists — and it surfaces on the first query of a twenty-minute
+sweep, not at startup.
+
 ```bash
 cargo build --release
 
