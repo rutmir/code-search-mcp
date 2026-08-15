@@ -156,3 +156,48 @@ gain. Deciding that per query beats setting it per project.
 And note what the table does *not* say. Latency here is a CPU host's; on a
 GPU the same quality gain costs almost nothing and the trade is obvious.
 That is the reason quality and latency are reported separately.
+
+## A second one: corpus size changes the answer
+
+The set above runs against 648 chunks. Repeating the exercise on a real
+project — 6702 chunks, documentation in Russian — moved two conclusions,
+which is the argument for measuring on the corpus you actually search.
+
+**Both retrieval legs earn their place, but only at scale.** On the small
+corpus every correct hit arrived via `both`, suggesting the two legs were
+redundant. That was an artifact: at 648 chunks a top-30 from each side
+covers 5% of everything. On the real corpus, 14 of 34 correct hits came in
+through exactly one leg — 5 dense-only, 9 sparse-only.
+
+**The cross-encoder rescues the tail; it does not improve the head.**
+Turning reranking off entirely on the large corpus:
+
+| | recall@1 | recall@3 | recall@5 | recall@10 | MRR | p50 |
+|---|---|---|---|---|---|---|
+| off | 0.657 | 0.800 | 0.829 | 0.886 | 0.740 | **0.24 s** |
+| on | 0.657 | 0.800 | 0.829 | **0.971** | 0.748 | 42 s |
+
+The first five positions are identical. Every bit of the gain is candidates
+promoted from ranks 11–30 into the visible ten — which is exactly what the
+design permits, since reranking reorders a `rerank_top_n` head and cannot
+introduce anything the retrieval pool missed. At 177× the latency on this
+host.
+
+Per category, the same run:
+
+| | MRR off | MRR on | recall@10 off | recall@10 on |
+|---|---|---|---|---|
+| `symbol` | 0.967 | 0.967 | 1.000 | 1.000 |
+| `docs_ru` | 0.822 | 0.833 | 1.000 | 1.000 |
+| `docs` | 0.320 | 0.469 | 0.800 | 1.000 |
+| `semantic` | 0.570 | **0.518** | 0.700 | 0.900 |
+
+Exact-identifier lookups gain nothing from the cross-encoder — the same
+0.967 on both corpora, now measured twice. And `semantic` is the one
+category where reranking *hurts* the ordering while helping coverage: it
+pulls two correct answers up from the tail and pushes others down.
+
+The `docs` / `docs_ru` rows are the same five questions in two languages.
+Asking in the language the documents are written in was worth more than the
+cross-encoder was, and cost nothing — see the 2026-08-15 changelog entry,
+which corrected the project's advice on the strength of these numbers.
