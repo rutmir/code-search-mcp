@@ -52,7 +52,7 @@ Use Grep / Read / Bash directly only when:
 
 **Tip**: concise queries (3-10 words) outperform long descriptions. The reranker sees more signal in a tight phrase.
 
-**Tip**: phrase queries in **English**, even when discussing the project in another language. The reference embedding model (`jina-code-embeddings`) is trained on English-code pairs — the dense leg is noticeably weaker on non-English queries, while identifiers and keywords in the query work equally well either way (BM25 leg).
+**Tip**: phrase a query in **the language the text you want is written in**. Identifiers are English whatever you do, so code lookups are unaffected — but for prose, asking in the document's own language wins clearly. Measured on a project with Russian documentation: the same five questions scored MRR 0.82 asked in Russian against 0.32 asked in English, and found the right document every time instead of four times in five. Translating the question yourself just adds a gap for retrieval to bridge.
 
 ---
 

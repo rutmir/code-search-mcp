@@ -484,7 +484,13 @@ fn handle_tools_list() -> Value {
                             \n\
                             Tip: concise queries (3-10 words) usually outperform long \
                             descriptions. The reranker sees more semantic signal in a \
-                            tight phrase than in a paragraph.",
+                            tight phrase than in a paragraph. \
+                            \n\n\
+                            Tip: phrase the query in the language the target text is \
+                            written in. Identifiers are English regardless, so code \
+                            lookups are unaffected — but for prose, asking in the \
+                            document's own language is markedly better than translating \
+                            the question first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

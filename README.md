@@ -342,6 +342,8 @@ cp examples/CLAUDE.md /path/to/your/project/CLAUDE.md
 # edit the "Project-specific notes" section at the bottom to point at your own canonical files
 ```
 
+**If your documentation isn't in English**, the template's advice on query language matters: ask in the language the document is written in, not in English. Identifiers are English whatever you do, so code lookups are unaffected — but on a project with Russian docs, the same five questions scored MRR 0.82 asked in Russian against 0.32 asked in English, and found the right document every time instead of four times in five (`eval/`, 6702-chunk corpus). Translating the question yourself only adds a gap for retrieval to bridge.
+
 The example tells Claude Code to use `code_search` BEFORE Grep / Glob / Read / Bash for any question about project content (code, docs, ROADMAPs, configs), and lists the genuine fall-back cases (known file paths, exact-bytes ops, non-indexed paths). After restart, Claude Code will reach for `code_search` first for exploration queries — visible as `tools/call code_search` entries in the MCP server's stderr logs at `~/.cache/claude-cli-nodejs/<project-slug>/mcp-logs-code-search/`.
 
 ## Configuration reference

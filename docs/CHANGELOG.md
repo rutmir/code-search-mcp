@@ -2,6 +2,21 @@
 
 History of significant changes. Newest at the top. Dates are when work landed locally; this project doesn't tag releases yet.
 
+## 2026-08-15
+
+### Query-language advice was backwards for non-English documentation
+
+`examples/CLAUDE.md` told the calling model to *"phrase queries in English, even when discussing the project in another language"*, reasoning that the embedding model is trained on English-code pairs. That reasoning holds for code — identifiers are English whatever you do — but it was never checked against prose, and for prose it is wrong.
+
+Measured with the new `eval/` harness on a project whose documentation is written in Russian (6702-chunk corpus), asking the same five questions in each language:
+
+| | recall@10 | MRR |
+|---|---|---|
+| English | 0.800 | 0.320 |
+| Russian | **1.000** | **0.822** |
+
+The advice is now "phrase the query in the language the target text is written in", in the template, the README, and the `code_search` tool description itself — the last being the one the model actually reads. Translating the question first only adds a gap for retrieval to bridge; BM25 has nothing to match, and the dense leg handles the document's own language better than the translation.
+
 ## 2026-08-14 — v0.0.6
 
 ### AIMD: a failed batch could be re-sent byte-identical
