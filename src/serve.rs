@@ -31,7 +31,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
-use crate::search::{SearchContext, SearchParams, SearchResult, SearchStage};
+use crate::search::{
+    RerankOutcome, SearchContext, SearchOutcome, SearchParams, SearchResult, SearchStage,
+};
 use crate::watcher;
 
 /// Map from JSON-RPC stringified request id → cancel sender. A spawned
@@ -659,19 +661,28 @@ async fn handle_code_search(
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     match result {
-        Ok(results) => {
+        Ok(outcome) => {
             info!(
-                results = results.len(),
-                elapsed_ms, "tools/call code_search completed"
+                results = outcome.results.len(),
+                rerank = ?outcome.rerank,
+                elapsed_ms,
+                "tools/call code_search completed"
             );
             if let Some(log_path) = &config.serve.query_log_path {
-                append_query_log(log_path, query, lang, path, limit, elapsed_ms, &results);
+                append_query_log(
+                    log_path,
+                    query,
+                    lang,
+                    path,
+                    limit,
+                    elapsed_ms,
+                    &outcome.results,
+                );
             }
-            let rerank_expected = config.reranker.as_ref().is_some_and(|r| r.enabled);
             Ok(json!({
                 "content": [{
                     "type": "text",
-                    "text": format_results_for_llm(&results, query, elapsed_ms, rerank_expected)
+                    "text": format_results_for_llm(&outcome, query, elapsed_ms)
                 }],
                 "isError": false
             }))
@@ -845,12 +856,8 @@ fn append_query_log(
 /// Render search results as a structured text block the LLM can quote
 /// from in subsequent reasoning. Lines stay short, paths are obvious,
 /// scores are visible for sanity-checking.
-fn format_results_for_llm(
-    results: &[SearchResult],
-    query: &str,
-    elapsed_ms: u64,
-    rerank_expected: bool,
-) -> String {
+fn format_results_for_llm(outcome: &SearchOutcome, query: &str, elapsed_ms: u64) -> String {
+    let results = &outcome.results;
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -863,14 +870,12 @@ fn format_results_for_llm(
         let _ = writeln!(s, "(no matches — try a different query or remove filters)");
         return s;
     }
-    // Rerank runs unconditionally in serve mode whenever a reranker is
-    // configured, so a result set where no hit carries a rerank score
-    // means the cross-encoder call failed and search fell back to
-    // retrieval-only RRF ranking. Surface that to the LLM (and the human
-    // reading the transcript) instead of degrading silently — the
-    // ordering is noticeably weaker without the reranker. No warning when
-    // the reranker is intentionally disabled in config.
-    if rerank_expected && results.iter().all(|r| r.rerank_score.is_none()) {
+    // Only a genuine failure is worth warning about. Absent rerank scores
+    // used to be the signal, but that cannot distinguish a dead
+    // cross-encoder from one deliberately skipped for a bare symbol
+    // lookup — where the ordering is not degraded at all, and crying wolf
+    // would teach the model to discount a warning that matters.
+    if outcome.rerank == RerankOutcome::Failed {
         let _ = writeln!(
             s,
             "WARNING: reranker unavailable — results are RRF-ranked only (lower precision). \
@@ -1056,9 +1061,13 @@ mod tests {
         assert!(r.get("result").is_none());
     }
 
+    fn outcome(results: Vec<SearchResult>, rerank: RerankOutcome) -> SearchOutcome {
+        SearchOutcome { results, rerank }
+    }
+
     #[test]
     fn format_results_empty() {
-        let s = format_results_for_llm(&[], "x", 5, true);
+        let s = format_results_for_llm(&outcome(vec![], RerankOutcome::Applied), "x", 5);
         assert!(s.contains("no matches"));
     }
 
@@ -1080,7 +1089,11 @@ mod tests {
 
     #[test]
     fn format_results_renders_each_hit() {
-        let s = format_results_for_llm(&[sample_result(Some(0.91))], "q", 5, true);
+        let s = format_results_for_llm(
+            &outcome(vec![sample_result(Some(0.91))], RerankOutcome::Applied),
+            "q",
+            5,
+        );
         assert!(s.contains("src/foo.rs:10-20"));
         assert!(s.contains("rust"));
         assert!(s.contains("0.9100"));
@@ -1091,19 +1104,29 @@ mod tests {
     }
 
     #[test]
-    fn format_results_warns_on_rerank_fallback() {
-        // Reranker expected but no hit carries a rerank score → the RRF
-        // fallback fired; the LLM must see that the ordering is degraded.
-        let s = format_results_for_llm(&[sample_result(None)], "q", 5, true);
+    fn format_results_warns_only_on_rerank_failure() {
+        // A failed cross-encoder call genuinely degrades the ordering, and
+        // the model must be told.
+        let s = format_results_for_llm(
+            &outcome(vec![sample_result(None)], RerankOutcome::Failed),
+            "q",
+            5,
+        );
         assert!(s.contains("WARNING"));
         assert!(s.contains("RRF"));
     }
 
     #[test]
-    fn format_results_no_warning_when_rerank_disabled() {
-        // Reranker intentionally disabled in config — RRF-only is the
-        // expected mode, not a degradation.
-        let s = format_results_for_llm(&[sample_result(None)], "q", 5, false);
-        assert!(!s.contains("WARNING"));
+    fn format_results_silent_when_rerank_skipped_on_purpose() {
+        // Same absence of rerank scores, opposite meaning: a bare symbol
+        // lookup where skipping is measured to cost nothing. Warning here
+        // would train the model to discount the one that matters.
+        for state in [
+            RerankOutcome::SkippedSymbolQuery,
+            RerankOutcome::NotRequested,
+        ] {
+            let s = format_results_for_llm(&outcome(vec![sample_result(None)], state), "q", 5);
+            assert!(!s.contains("WARNING"), "unexpected warning for {state:?}");
+        }
     }
 }

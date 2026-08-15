@@ -117,6 +117,28 @@ impl SearchStage {
 /// Callback invoked as the search moves between stages.
 pub type ProgressSink<'a> = &'a (dyn Fn(SearchStage) + Send + Sync);
 
+/// What became of the cross-encoder stage. Reported alongside the results
+/// so the caller can tell a deliberate skip from a failure — the two look
+/// identical from the outside (no `rerank_score` on any hit) but mean
+/// opposite things about whether to trust the ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankOutcome {
+    /// Ran, and its vote is fused into the final scores.
+    Applied,
+    /// No reranker configured, or the caller asked to go without.
+    NotRequested,
+    /// Skipped on purpose: a bare symbol lookup that retrieval already
+    /// answered. See [`is_bare_symbol_query`].
+    SkippedSymbolQuery,
+    /// Attempted and failed; ranking fell back to retrieval-only RRF.
+    Failed,
+}
+
+pub struct SearchOutcome {
+    pub results: Vec<SearchResult>,
+    pub rerank: RerankOutcome,
+}
+
 pub struct SearchParams<'a> {
     pub query: &'a str,
     pub limit: usize,
@@ -219,7 +241,7 @@ impl SearchContext {
         }
     }
 
-    pub async fn search(&self, params: SearchParams<'_>) -> Result<Vec<SearchResult>> {
+    pub async fn search(&self, params: SearchParams<'_>) -> Result<SearchOutcome> {
         let config = &self.config;
         let started = std::time::Instant::now();
 
@@ -340,7 +362,10 @@ impl SearchContext {
 
         let mut merged: Vec<Candidate> = by_id.into_values().collect();
         if merged.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SearchOutcome {
+                results: Vec::new(),
+                rerank: RerankOutcome::NotRequested,
+            });
         }
 
         // Exact-symbol boost: when the query literally names a chunk's symbol
@@ -374,6 +399,27 @@ impl SearchContext {
             "merged"
         );
 
+        // A bare symbol lookup whose symbol retrieval already ranked first
+        // gains nothing from the cross-encoder. Measured on two corpora
+        // (648 and 6702 chunks): identical MRR and recall@10 with the
+        // reranker on and off, for tens of seconds of latency on a
+        // CPU-bound host. Both halves of the condition matter — "is the
+        // query nothing but an identifier" keeps prose that merely mentions
+        // a symbol out of it, and "did retrieval put that symbol first"
+        // means we only skip when there is visibly nothing left to fix.
+        let skip_rerank_as_symbol_lookup = is_bare_symbol_query(params.query)
+            && merged
+                .first()
+                .and_then(|c| c.name.as_deref())
+                .is_some_and(|name| query_names_symbol(params.query, name));
+        if skip_rerank_as_symbol_lookup {
+            debug!(
+                query = %params.query,
+                top = %merged[0].file,
+                "bare symbol lookup already answered by retrieval — skipping rerank"
+            );
+        }
+
         // 4. Two-stage rerank:
         //    a) Split merged into head (top rerank_top_n by RRF) and tail (rest).
         //    b) Upgrade head's previews to full chunk content (one batched
@@ -390,7 +436,15 @@ impl SearchContext {
         //    If the reranker call fails (server down, ctx overflow, timeout),
         //    we fall back to RRF-sorted results rather than failing the whole
         //    search. The user still gets something useful; warn logged.
-        let want_rerank = params.use_rerank && self.reranker.is_some();
+        let want_rerank =
+            params.use_rerank && self.reranker.is_some() && !skip_rerank_as_symbol_lookup;
+        let mut rerank = if !params.use_rerank || self.reranker.is_none() {
+            RerankOutcome::NotRequested
+        } else if skip_rerank_as_symbol_lookup {
+            RerankOutcome::SkippedSymbolQuery
+        } else {
+            RerankOutcome::Applied
+        };
 
         let mut head = merged;
         let tail: Vec<Candidate> = if want_rerank && head.len() > rerank_top_n {
@@ -444,6 +498,7 @@ impl SearchContext {
                         error = %e,
                         "reranker failed; falling back to RRF-only ranking"
                     );
+                    rerank = RerankOutcome::Failed;
                     head.into_iter()
                         .map(|c| {
                             let rrf = c.rrf;
@@ -475,13 +530,16 @@ impl SearchContext {
         params.report(SearchStage::Finalizing);
         let mut final_results = head_results;
         final_results.extend(tail_results);
-        Ok(final_results.into_iter().take(params.limit).collect())
+        Ok(SearchOutcome {
+            results: final_results.into_iter().take(params.limit).collect(),
+            rerank,
+        })
     }
 }
 
 /// One-shot search: build a context, run a single query, drop it. The CLI
 /// path — `serve` holds a [`SearchContext`] instead.
-pub async fn run(config: &Config, params: SearchParams<'_>) -> Result<Vec<SearchResult>> {
+pub async fn run(config: &Config, params: SearchParams<'_>) -> Result<SearchOutcome> {
     let ctx = SearchContext::new(config).await?;
     ctx.search(params).await
 }
@@ -560,6 +618,45 @@ fn fuse_rerank_votes(rrf: &[f32], rerank: &[f32], rrf_k: usize, weight: f32) -> 
     fused
 }
 
+/// Is the query nothing but an identifier — a lookup rather than a question?
+///
+/// True for `AdaptiveBatcher::note_failure`, `build_si_portfolio`,
+/// `queryNamesSymbol`. False as soon as ordinary words are mixed in
+/// ("how does Watcher::run shut down"), because that is a question the
+/// cross-encoder may well help with, and false for a lone lowercase word
+/// like `arbiter`, which is as likely to be prose as an identifier.
+///
+/// Deliberately narrow: it gates skipping the reranker, and the evidence
+/// for skipping covers exactly this shape of query. Anything broader would
+/// be extrapolation.
+fn is_bare_symbol_query(query: &str) -> bool {
+    /// Two allows a qualified name that the tokenizer happens to split, or
+    /// a symbol given with one qualifier. Beyond that it reads as prose.
+    const MAX_TOKENS: usize = 2;
+
+    let mut tokens = 0usize;
+    for raw in query.split(|ch: char| !(ch.is_alphanumeric() || "_:.".contains(ch))) {
+        let t = raw.trim_matches(|ch: char| ch == ':' || ch == '.');
+        if t.is_empty() {
+            continue;
+        }
+        tokens += 1;
+        if tokens > MAX_TOKENS || !looks_like_identifier(t) {
+            return false;
+        }
+    }
+    tokens > 0
+}
+
+/// Does this token look like code rather than a word? Shared by the symbol
+/// boost and the bare-lookup check so the two can't drift apart.
+fn looks_like_identifier(t: &str) -> bool {
+    t.contains('_')
+        || t.contains("::")
+        || t.contains('.')
+        || t.chars().skip(1).any(|c| c.is_uppercase())
+}
+
 /// Does the query literally name this symbol?
 ///
 /// Query tokens are runs of identifier-ish chars (`[A-Za-z0-9_:.]`). A
@@ -573,12 +670,7 @@ fn fuse_rerank_votes(rrf: &[f32], rerank: &[f32], rrf_k: usize, weight: f32) -> 
 /// Consequence: single-word lowercase symbols (`run`, `new`, `main`) are
 /// only boosted when qualified in the query (`Watcher::run`).
 fn query_names_symbol(query: &str, name: &str) -> bool {
-    fn is_identifier_like(t: &str) -> bool {
-        t.contains('_')
-            || t.contains("::")
-            || t.contains('.')
-            || t.chars().skip(1).any(|c| c.is_uppercase())
-    }
+    let is_identifier_like = looks_like_identifier;
     let name_is_qualified = name.contains("::") || name.contains('.');
     let name_tail = name
         .rsplit("::")
@@ -756,6 +848,66 @@ mod tests {
         let rerank = [1.0, 1.0];
         let fused = fuse_rerank_votes(&rrf, &rerank, 60, 2.0);
         assert_eq!(ranking(&fused), vec![1, 0]);
+    }
+
+    #[test]
+    fn bare_symbol_query_recognized() {
+        // The shape the measurement covers: an identifier and nothing else.
+        for q in [
+            "AdaptiveBatcher::note_failure",
+            "build_si_portfolio",
+            "queryNamesSymbol",
+            "SignalArbiter",
+            "Portfolio.buildSiPortfolio",
+            "  fetch_file_vectors  ",
+        ] {
+            assert!(is_bare_symbol_query(q), "{q:?} should be a bare lookup");
+        }
+    }
+
+    #[test]
+    fn questions_are_not_bare_symbol_queries() {
+        // Prose that merely mentions a symbol is still a question, and the
+        // cross-encoder has not been shown to be useless on those.
+        for q in [
+            "how does AdaptiveBatcher::note_failure work",
+            "where is build_si_portfolio called from",
+            "adaptive batching halving on failure",
+            "arbiter",
+            "run",
+            "",
+            "   ",
+        ] {
+            assert!(
+                !is_bare_symbol_query(q),
+                "{q:?} should not be a bare lookup"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_symbol_query_caps_token_count() {
+        // Two identifiers can be a qualified name split by punctuation;
+        // three reads as prose written in camelCase, which is not the
+        // measured case.
+        assert!(is_bare_symbol_query("Portfolio::build_si_portfolio"));
+        assert!(is_bare_symbol_query("Foo_bar Baz_qux"));
+        assert!(!is_bare_symbol_query("Foo_bar Baz_qux Quux_corge"));
+    }
+
+    #[test]
+    fn skip_decision_needs_both_halves() {
+        // The gate is "bare lookup" AND "retrieval already put that symbol
+        // first". Each half alone must not be enough — that pairing is what
+        // makes skipping safe.
+        let query = "note_failure";
+        assert!(is_bare_symbol_query(query));
+        // Retrieval found the symbol → skipping is justified.
+        assert!(query_names_symbol(query, "AdaptiveBatcher::note_failure"));
+        // Retrieval's top hit is something else → do not skip.
+        assert!(!query_names_symbol(query, "Indexer::process_one_file"));
+        // A question naming the same symbol fails the first half.
+        assert!(!is_bare_symbol_query("what does note_failure do"));
     }
 
     #[test]
