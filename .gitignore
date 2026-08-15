@@ -25,3 +25,6 @@ dev/
 .dev/
 
 CLAUDE.md
+
+# Python bytecode from the eval harness
+__pycache__/

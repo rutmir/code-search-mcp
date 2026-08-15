@@ -1,0 +1,233 @@
+# Ground-truth query set for this repository.
+#
+# Each entry is a question with the file(s) that genuinely answer it. A query
+# counts as answered when any expected file appears in the returned hits; the
+# rank of that first correct hit drives MRR and recall@k.
+#
+# Rules that keep the set honest:
+#   - `files` is where a person would actually look, not every file that
+#     happens to contain the words. A set that accepts near-misses cannot
+#     detect a ranking regression.
+#   - Categories are load-bearing: they isolate which retrieval leg moved.
+#     `symbol` leans on BM25's `name` field and the exact-symbol boost,
+#     `semantic` on the dense leg and the cross-encoder, `docs` on the
+#     heading chunker, `cross_cutting` on plain term matching.
+#   - Nothing under a hidden directory (.github, .cargo): the walker sets
+#     `hidden(true)`, so those files are never indexed and would be
+#     permanent, meaningless misses.
+#
+# Note this set describes *this* repo. For another project, copy the shape
+# and write its own — see eval/README.md.
+
+# ---------------------------------------------------------------- symbol --
+# Exact-identifier lookups: the queries that would otherwise send someone to
+# grep. Regressions here point at the `name` field boost or `symbol_boost`.
+
+[[query]]
+q = "AdaptiveBatcher::note_failure"
+category = "symbol"
+files = ["src/adaptive_batcher.rs"]
+symbol = "AdaptiveBatcher::note_failure"
+
+[[query]]
+q = "query_names_symbol"
+category = "symbol"
+files = ["src/search.rs"]
+symbol = "query_names_symbol"
+
+[[query]]
+q = "fuse_rerank_votes"
+category = "symbol"
+files = ["src/search.rs"]
+symbol = "fuse_rerank_votes"
+
+[[query]]
+q = "CodeTokenizer"
+category = "symbol"
+files = ["src/bm25.rs"]
+
+[[query]]
+q = "split_identifier"
+category = "symbol"
+files = ["src/bm25.rs"]
+symbol = "split_identifier"
+
+[[query]]
+q = "PathFilter"
+category = "symbol"
+files = ["src/walker.rs"]
+
+[[query]]
+q = "chunk_uuid"
+category = "symbol"
+files = ["src/indexer.rs"]
+symbol = "chunk_uuid"
+
+[[query]]
+q = "vanished_files"
+category = "symbol"
+files = ["src/watcher.rs"]
+symbol = "vanished_files"
+
+[[query]]
+q = "config_hard_fingerprint"
+category = "symbol"
+files = ["src/vector_store.rs"]
+symbol = "config_hard_fingerprint"
+
+[[query]]
+q = "SearchContext"
+category = "symbol"
+files = ["src/search.rs"]
+
+[[query]]
+q = "ChunkerSet"
+category = "symbol"
+files = ["src/chunker.rs"]
+
+[[query]]
+q = "estimate_timeout"
+category = "symbol"
+files = ["src/adaptive_batcher.rs"]
+symbol = "AdaptiveBatcher::estimate_timeout"
+
+[[query]]
+q = "lookup_contents"
+category = "symbol"
+files = ["src/bm25.rs"]
+symbol = "Bm25Search::lookup_contents"
+
+[[query]]
+q = "fetch_file_vectors"
+category = "symbol"
+files = ["src/vector_store.rs"]
+symbol = "Client::fetch_file_vectors"
+
+# camelCase asked of a snake_case definition — the cross-style path through
+# the code-aware tokenizer.
+[[query]]
+q = "queryNamesSymbol"
+category = "symbol"
+files = ["src/search.rs"]
+symbol = "query_names_symbol"
+
+# -------------------------------------------------------------- semantic --
+# Natural-language questions with no literal identifier to latch onto. This
+# is where the dense leg and the cross-encoder earn their cost.
+
+[[query]]
+q = "how dense and sparse results are merged into one ranking"
+category = "semantic"
+files = ["src/search.rs"]
+
+[[query]]
+q = "cancelling an in-flight tool call"
+category = "semantic"
+files = ["src/serve.rs"]
+
+[[query]]
+q = "deciding a file has not changed since the last index"
+category = "semantic"
+files = ["src/indexer.rs"]
+
+[[query]]
+q = "what happens when the reranker is unavailable"
+category = "semantic"
+files = ["src/search.rs"]
+
+[[query]]
+q = "splitting markdown on section headings"
+category = "semantic"
+files = ["src/chunker.rs"]
+
+[[query]]
+q = "skipping binary files without reading them"
+category = "semantic"
+files = ["src/walker.rs", "src/indexer.rs"]
+
+[[query]]
+q = "reading the index without taking the write lock"
+category = "semantic"
+files = ["src/bm25.rs"]
+
+[[query]]
+q = "what makes the collection get wiped and rebuilt"
+category = "semantic"
+files = ["src/vector_store.rs", "src/indexer.rs"]
+
+[[query]]
+q = "debouncing filesystem events before reindexing"
+category = "semantic"
+files = ["src/watcher.rs"]
+
+[[query]]
+q = "reusing stored vectors for chunks that did not change"
+category = "semantic"
+# The decision lives in indexer.rs, the fetch that makes it possible in
+# vector_store.rs::fetch_file_vectors — whose doc comment explains the whole
+# mechanism. Landing in either answers the question, so listing only one
+# would make the set wrong rather than strict.
+files = ["src/indexer.rs", "src/vector_store.rs"]
+
+[[query]]
+q = "growing and shrinking the embedding batch size"
+category = "semantic"
+files = ["src/adaptive_batcher.rs"]
+
+[[query]]
+q = "returning the full text of a chunk instead of a preview"
+category = "semantic"
+files = ["src/serve.rs", "src/bm25.rs"]
+
+# ------------------------------------------------------------------ docs --
+# Prose lookups. Exercises the heading chunker and, indirectly, whether docs
+# can compete with code for the same words.
+
+[[query]]
+q = "changelog entry about the code-aware tokenizer"
+category = "docs"
+files = ["docs/CHANGELOG.md"]
+
+[[query]]
+q = "wiring the server into Claude Code"
+category = "docs"
+files = ["README.md"]
+
+[[query]]
+q = "docker compose for the development stack"
+category = "docs"
+files = ["CONTRIBUTING.md", "README.md"]
+
+[[query]]
+q = "per language chunking strategy reference config"
+category = "docs"
+files = ["examples/full-config.toml"]
+
+[[query]]
+q = "how to add support for a new language"
+category = "docs"
+files = ["CONTRIBUTING.md"]
+
+# --------------------------------------------------------- cross_cutting --
+# Terms that appear in several places; the question is whether the *right*
+# place ranks first.
+
+[[query]]
+q = "minimum supported rust version"
+category = "cross_cutting"
+files = ["Cargo.toml", "CONTRIBUTING.md", "README.md"]
+
+[[query]]
+q = "stdout is reserved for JSON-RPC framing"
+category = "cross_cutting"
+files = ["src/serve.rs", "src/main.rs"]
+
+[[query]]
+q = "reciprocal rank fusion constant default 60"
+category = "cross_cutting"
+files = ["src/search.rs", "src/config.rs"]
+
+[[query]]
+q = "query log written by the serve command"
+category = "cross_cutting"
+files = ["src/serve.rs", "src/config.rs"]
