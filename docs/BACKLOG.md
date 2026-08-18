@@ -5,6 +5,10 @@ entry states what is wrong, how to approach it, and — importantly — how you
 would know it worked, since several of these are the kind of change that
 looks right and isn't.
 
+Finished entries stay, struck through, with what actually happened. Several
+were wrong about something before they were done, and the correction is the
+part worth keeping.
+
 Everything here came out of the review and measurement work of August 2026;
 the numbers quoted are from `eval/` and from real reindexing runs, not from
 argument. See `docs/CHANGELOG.md` for what has already landed.
@@ -146,29 +150,61 @@ scoring can.
 
 ---
 
-## 4. Move the tree-sitter family to ABI 0.23
+## 4. ~~Move the tree-sitter family to ABI 0.23~~
 
-**Status:** large, and gated on a correctness fix that must ship with it.
+**Status: done, v0.0.9 and v0.1.0.** Landed at 0.25 rather than 0.23 — the
+ecosystem had moved on. All nine grammars upgraded, plus Kotlin and Swift
+emitters added, taking tree-sitter coverage to eleven languages.
 
-One upgrade closes three separate things: Kotlin and Swift grammars (the
-language buckets are already in place and line-chunked), `ring` >= 0.17.12
-— currently an accepted advisory in `.cargo/audit.toml`, blocked because
-`tree-sitter-javascript 0.21.4` pins `cc = "~1.0.90"` — and two unsound
-advisories in `lru`, blocked by `tantivy 0.22`.
+`ring` is unblocked and now at 0.17.14: `tree-sitter-javascript 0.21.4`
+pinned `cc = "~1.0.90"`, and lifting that let `cc` reach 1.4.3.
+RUSTSEC-2025-0009 is closed and its entry removed from `.cargo/audit.toml`,
+verified by deleting the ignore file and re-running the audit clean.
 
-**Do not start this without also fixing the fingerprint.** Grammar versions
-are *not* part of `config_hard` (`vector_store.rs::config_hard_fingerprint`
-covers chunking parameters, the embedding model and `bm25::SCHEMA_VERSION`).
-If a new grammar cuts AST boundaries even slightly differently, chunk
-identities change with no auto-clear, and old and new chunks coexist as
-orphans — precisely the failure the marker exists to prevent. Add the grammar
-revision to the hard fingerprint in the same change, and expect a full
-reindex (~3.5 h on a 6702-chunk project).
+Two corrections to what this entry used to claim:
 
-**Suggested order:** upgrade the existing nine grammars first and confirm the
-`chunker.rs::tests::ts_*` suite passes untouched — that tells you whether the
-emitters need reworking for renamed grammar fields. Only then add Kotlin and
-Swift, which are new emitters rather than migrations.
+- It said the upgrade would also close the `lru` advisories. It does not —
+  those are held by `tantivy 0.22`. They remain open, and closing them means
+  a tantivy upgrade, which touches the BM25 schema and so does force a
+  rebuild.
+- It said the fingerprint *must* be bumped. That was reasoning, and it was
+  checked instead: this repo and a 6702-chunk project were indexed with both
+  binaries into separate collections and their `chunk_uuid` sets compared.
+  Rust, markdown and toml over 21 files, and Python over 7 files: every id
+  identical. So no bump and no reindex. The concern was real but the premise
+  was not — worth remembering that the failure mode is *silence*, since the
+  sha cache keys on file content and would have skipped every file, leaving
+  the new chunking to arrive one edit at a time.
+
+Not covered by that comparison: C++, Go, Java, JavaScript and TypeScript, for
+which no corpus was available. Dart chunking did change (the grammar was
+rewritten between 0.0.4 and 0.2.0), so a project that enabled tree-sitter for
+Dart needs a manual `clear`.
+
+**Left behind for whoever needs it:** `tree-sitter-kotlin` 0.3 still targets
+tree-sitter 0.20, and cargo resolves that by linking a second copy of the
+parser — `cargo metadata` and `cargo tree` both look fine, and only a real
+parse attempt fails to typecheck. Use `tree-sitter-kotlin-ng`.
+
+---
+
+## 5. The `lru` advisories need a tantivy upgrade
+
+**Status:** open, and the only outstanding advisory work.
+
+`cargo audit` reports three warnings: `instant` (unmaintained, transitive
+and harmless) and two unsound findings in `lru` 0.12.5 — RUSTSEC-2026-0002
+and RUSTSEC-2026-0253. Both are held by `tantivy 0.22`, which pins `lru`
+`^0.12` while the fixes landed in 0.18.2.
+
+Note this one *does* force a rebuild, unlike the tree-sitter upgrade: a
+tantivy version change means a `bm25::SCHEMA_VERSION` bump, which feeds
+`config_hard`, which auto-clears. Price it at ~3.5 h on a 6702-chunk
+project before starting.
+
+Neither advisory is a vulnerability — they are unsoundness that requires
+`catch_unwind` around a panicking `Drop` to reach. Low urgency; do it when
+a tantivy upgrade is wanted for its own sake.
 
 ---
 
