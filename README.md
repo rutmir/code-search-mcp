@@ -231,7 +231,7 @@ A complete annotated example with every knob explained lives at `examples/full-c
 | `rust` | tree-sitter | `Type::method` | `impl_method` for impl blocks |
 | `python` | tree-sitter | `Class.method` | `@decorator` preserved; imports grouped |
 | `cpp` | tree-sitter | `Type::method` | inline + outline methods; templates unwrapped |
-| `dart` | tree-sitter | `Class.method` | class methods reliable; top-level fns fall back |
+| `dart` | tree-sitter | `Class.method` | classes, methods, constructors and top-level functions |
 | `typescript` | tree-sitter | `Class.method` | export keyword preserved, interface/type/enum |
 | `javascript` | tree-sitter | `Class.method` | subset of TS emitter |
 | `go` | tree-sitter | `Receiver.method` | pointer & value receivers normalized |

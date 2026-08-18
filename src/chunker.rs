@@ -464,7 +464,7 @@ pub enum LangId {
 impl TreeSitterChunker {
     pub fn new_rust(max_chars: usize, fallback: LineChunker) -> Result<Self> {
         assert!(max_chars > 0);
-        let language = tree_sitter_rust::language();
+        let language = tree_sitter_rust::LANGUAGE.into();
         Ok(Self {
             max_chars,
             lang_id: LangId::Rust,
@@ -475,7 +475,7 @@ impl TreeSitterChunker {
 
     pub fn new_python(max_chars: usize, fallback: LineChunker) -> Result<Self> {
         assert!(max_chars > 0);
-        let language = tree_sitter_python::language();
+        let language = tree_sitter_python::LANGUAGE.into();
         Ok(Self {
             max_chars,
             lang_id: LangId::Python,
@@ -486,7 +486,7 @@ impl TreeSitterChunker {
 
     pub fn new_dart(max_chars: usize, fallback: LineChunker) -> Result<Self> {
         assert!(max_chars > 0);
-        let language = tree_sitter_dart::language();
+        let language = tree_sitter_dart::LANGUAGE.into();
         Ok(Self {
             max_chars,
             lang_id: LangId::Dart,
@@ -497,7 +497,7 @@ impl TreeSitterChunker {
 
     pub fn new_cpp(max_chars: usize, fallback: LineChunker) -> Result<Self> {
         assert!(max_chars > 0);
-        let language = tree_sitter_cpp::language();
+        let language = tree_sitter_cpp::LANGUAGE.into();
         Ok(Self {
             max_chars,
             lang_id: LangId::Cpp,
@@ -511,7 +511,7 @@ impl TreeSitterChunker {
         // tree-sitter-typescript exposes both a TS grammar and a TSX one.
         // We use the TSX grammar because it's a strict superset (parses
         // plain .ts files identically while also handling .tsx).
-        let language = tree_sitter_typescript::language_tsx();
+        let language = tree_sitter_typescript::LANGUAGE_TSX.into();
         Ok(Self {
             max_chars,
             lang_id: LangId::TypeScript,
@@ -522,7 +522,7 @@ impl TreeSitterChunker {
 
     pub fn new_javascript(max_chars: usize, fallback: LineChunker) -> Result<Self> {
         assert!(max_chars > 0);
-        let language = tree_sitter_javascript::language();
+        let language = tree_sitter_javascript::LANGUAGE.into();
         Ok(Self {
             max_chars,
             lang_id: LangId::JavaScript,
@@ -533,7 +533,7 @@ impl TreeSitterChunker {
 
     pub fn new_go(max_chars: usize, fallback: LineChunker) -> Result<Self> {
         assert!(max_chars > 0);
-        let language = tree_sitter_go::language();
+        let language = tree_sitter_go::LANGUAGE.into();
         Ok(Self {
             max_chars,
             lang_id: LangId::Go,
@@ -544,7 +544,7 @@ impl TreeSitterChunker {
 
     pub fn new_csharp(max_chars: usize, fallback: LineChunker) -> Result<Self> {
         assert!(max_chars > 0);
-        let language = tree_sitter_c_sharp::language();
+        let language = tree_sitter_c_sharp::LANGUAGE.into();
         Ok(Self {
             max_chars,
             lang_id: LangId::CSharp,
@@ -555,7 +555,7 @@ impl TreeSitterChunker {
 
     pub fn new_java(max_chars: usize, fallback: LineChunker) -> Result<Self> {
         assert!(max_chars > 0);
-        let language = tree_sitter_java::language();
+        let language = tree_sitter_java::LANGUAGE.into();
         Ok(Self {
             max_chars,
             lang_id: LangId::Java,
@@ -897,7 +897,7 @@ impl TreeSitterChunker {
     ) {
         let kind = node.kind();
         match kind {
-            "class_definition" => self.emit_dart_class(source, node, path, out),
+            "class_declaration" => self.emit_dart_class(source, node, path, out),
             "enum_declaration" => {
                 let name = field_text(source, node, "name");
                 self.emit_one(source, node, path, "enum", name, out);
@@ -910,12 +910,15 @@ impl TreeSitterChunker {
                 let name = field_text(source, node, "name");
                 self.emit_one(source, node, path, "extension", name, out);
             }
-            "function_signature" => {
-                // Possible at top level on some Dart inputs (the grammar's
-                // top-level coverage is fuzzy in 0.0.4). When inside a class
-                // body our class emitter handles it; this path is for any
-                // top-level signature the grammar does surface.
-                let name = field_text(source, node, "name");
+            // A top-level function. `function_declaration` is what the
+            // 0.2 grammar produces and it carries the body; bare
+            // `function_signature` is kept because some inputs still
+            // surface a signature without one.
+            "function_declaration" | "function_signature" => {
+                let name = node
+                    .child_by_field_name("signature")
+                    .and_then(|sig| field_text(source, sig, "name"))
+                    .or_else(|| field_text(source, node, "name"));
                 let qualified = match (parent_type, name) {
                     (Some(parent), Some(method)) => Some(format!("{}.{}", parent, method)),
                     (None, Some(method)) => Some(method),
@@ -948,7 +951,7 @@ impl TreeSitterChunker {
         };
         let mut cursor = body.walk();
         for member in body.children(&mut cursor) {
-            if member.kind() != "class_member_definition" {
+            if member.kind() != "class_member" {
                 continue;
             }
             // Inside a class_member_definition we look for a method_signature
@@ -1522,44 +1525,36 @@ fn item_kind_short(kind: &str) -> &'static str {
 /// `class_member_definition`. Returns None for non-method members like
 /// plain field declarations (which have no identifiable "method name").
 fn find_dart_method_name(source: &[u8], member: tree_sitter::Node) -> Option<String> {
-    // class_member_definition can directly hold a method_signature OR a
-    // declaration (field). We only care about methods.
-    let mut cursor = member.walk();
-    for child in member.children(&mut cursor) {
-        if child.kind() != "method_signature" {
-            continue;
+    /// How deep to look. A method reaches its name in three steps
+    /// (`class_member` → `method_declaration` → `method_signature` →
+    /// `function_signature`), a constructor in two (`class_member` →
+    /// `declaration` → `constructor_signature`). Four leaves headroom
+    /// without wandering into method bodies.
+    const MAX_DEPTH: usize = 4;
+
+    fn search(source: &[u8], node: tree_sitter::Node, depth: usize) -> Option<String> {
+        if depth > MAX_DEPTH {
+            return None;
         }
-        // Inside method_signature: function_signature / constructor_signature
-        // / getter_signature / setter_signature / operator_signature.
-        let mut sig_cursor = child.walk();
-        for sig in child.children(&mut sig_cursor) {
-            let inner_kind = sig.kind();
-            let interesting = matches!(
-                inner_kind,
-                "function_signature"
-                    | "constructor_signature"
-                    | "factory_constructor_signature"
-                    | "getter_signature"
-                    | "setter_signature"
-                    | "operator_signature"
-            );
-            if !interesting {
-                continue;
-            }
-            if let Some(name) = field_text(source, sig, "name") {
+        // Any `*_signature` that names something. `operator_signature` has
+        // no `name` field and is skipped by exactly that test rather than
+        // by being listed — one less thing to keep in sync with the
+        // grammar.
+        if node.kind().ends_with("_signature") {
+            if let Some(name) = field_text(source, node, "name") {
                 return Some(name);
             }
-            // Some sub-grammars store the name as a direct child identifier.
-            let mut id_cursor = sig.walk();
-            for c in sig.children(&mut id_cursor) {
-                if c.kind() == "identifier" {
-                    let bytes = source.get(c.start_byte()..c.end_byte())?;
-                    return std::str::from_utf8(bytes).ok().map(|s| s.to_string());
-                }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = search(source, child, depth + 1) {
+                return Some(found);
             }
         }
+        None
     }
-    None
+
+    search(source, member, 0)
 }
 
 /// Extract the receiver type name from a Go `method_declaration`. The
@@ -2280,6 +2275,50 @@ class Counter {
             methods.iter().any(|m| m.starts_with("Counter.")),
             "no Counter.* methods in {:?}",
             methods
+        );
+    }
+
+    #[test]
+    fn ts_dart_top_level_function() {
+        // Something the 0.0.4 grammar could not do reliably — its top-level
+        // coverage was fuzzy enough that standalone functions fell through
+        // to line-window chunking. The 0.2 grammar gives them a
+        // `function_declaration` with a named signature, so they get a real
+        // syntactic anchor like every other language.
+        let src = "\
+int add(int a, int b) => a + b;
+
+Future<void> main() async {
+  print(add(1, 2));
+}
+";
+        let c = ts_dart();
+        let chunks = c.chunk(src, &p());
+        let fns: Vec<&str> = chunks
+            .iter()
+            .filter(|c| c.kind.as_deref() == Some("fn"))
+            .filter_map(|c| c.name.as_deref())
+            .collect();
+        assert!(fns.contains(&"add"), "top-level `add` missing from {fns:?}");
+        assert!(
+            fns.contains(&"main"),
+            "top-level `main` missing from {fns:?}"
+        );
+    }
+
+    #[test]
+    fn ts_dart_constructor_is_named() {
+        // Constructors sit under `declaration` rather than
+        // `method_declaration`, which is why the name lookup searches for
+        // any `*_signature` carrying a `name` field instead of matching on
+        // node kinds.
+        let src = "class Point {\n  final int x;\n  Point(this.x);\n}\n";
+        let c = ts_dart();
+        let chunks = c.chunk(src, &p());
+        let names: Vec<&str> = chunks.iter().filter_map(|c| c.name.as_deref()).collect();
+        assert!(
+            names.contains(&"Point.Point"),
+            "constructor not named in {names:?}"
         );
     }
 

@@ -237,9 +237,8 @@ max_chunk_chars = 8000
 
 # Dart override: AST-aware chunking. Class / mixin / enum / extension at
 # top level; class methods become separate chunks qualified
-# `ClassName.method_name`. We use tree-sitter-dart 0.0.4 — class
-# structure is reliable; top-level standalone functions occasionally
-# fall through to line-window because that grammar is older.
+# `ClassName.method_name`. tree-sitter-dart 0.2 also names constructors
+# and top-level functions, which the 0.0.4 grammar could not do reliably.
 # Uncomment if your project has Dart code (already a recognized language
 # in walker).
 # [chunking.per_language.dart]

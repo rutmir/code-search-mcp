@@ -4,17 +4,11 @@
 [advisories]
 # Each entry is a deliberate, temporary acceptance — not a way to keep the
 # job green. Record why the advisory can't be acted on and what unblocks it.
-ignore = [
-    # RUSTSEC-2025-0009 — ring <0.17.12: some AES functions can panic when
-    # the build has overflow checks enabled. Worst case is a panic, not
-    # memory unsafety, and the release profile does not enable
-    # overflow-checks.
-    #
-    # Not fixable in isolation: ring >=0.17.12 requires a `cc` newer than
-    # 1.0.x, and `tree-sitter-javascript 0.21.4` (the newest 0.21.x, which
-    # is what the tree-sitter 0.22 ABI pins us to) declares
-    # `cc = "~1.0.90"`. Unblocked by upgrading the whole tree-sitter
-    # family to the 0.23 ABI — see the "Tree-sitter version coupling"
-    # constraint in CLAUDE.md. Re-check this entry whenever that happens.
-    "RUSTSEC-2025-0009",
-]
+#
+# Currently empty. RUSTSEC-2025-0009 (ring <0.17.12) lived here because
+# `ring` needed a `cc` newer than 1.0.x while `tree-sitter-javascript
+# 0.21.4` pinned `cc = "~1.0.90"`. The tree-sitter upgrade lifted that pin,
+# `ring` moved to 0.17.14 on its own, and the entry was removed rather than
+# left to rot — an ignore list nobody prunes stops being a record of
+# decisions and becomes a place advisories go to be forgotten.
+ignore = []

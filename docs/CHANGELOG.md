@@ -2,6 +2,37 @@
 
 History of significant changes. Newest at the top. Dates are when work landed locally; this project doesn't tag releases yet.
 
+## 2026-08-18 — v0.0.9
+
+### tree-sitter 0.22 → 0.25, and every grammar with it
+
+**No reindex.** Chunking was verified unchanged for the languages this was tested on — see below before assuming that covers yours.
+
+The nine grammar crates moved to their current releases (`rust` 0.24, `python`/`go`/`javascript` 0.25, `cpp`/`java`/`c-sharp`/`typescript` 0.23, `dart` 0.2). The API change was mechanical: `tree_sitter_x::language()` became the `LANGUAGE` constant. Eight of the nine emitters needed no work at all — 57 of 58 chunker tests passed untouched.
+
+**`ring` is unblocked.** `tree-sitter-javascript 0.21.4` pinned `cc = "~1.0.90"`, which held `ring` at 0.17.9 and made RUSTSEC-2025-0009 unfixable; it was an accepted advisory in `.cargo/audit.toml`. The upgrade lifted the pin, `cc` moved to 1.4.3 and `ring` to 0.17.14 on its own. Verified by deleting the ignore file and re-running `cargo audit`: still clean. The entry is gone rather than left to rot.
+
+Not unblocked: the two `lru` advisories, which are held by `tantivy 0.22`, not by tree-sitter. An earlier note claimed otherwise.
+
+### Dart chunking is properly structured now
+
+`tree-sitter-dart` went 0.0.4 → 0.2.0 and the grammar was rewritten: `class_definition` → `class_declaration`, and class bodies now hold `class_member` → `method_declaration` → `method_signature`. The emitter follows, and the name lookup is now a bounded recursive search for any `*_signature` carrying a `name` field rather than a list of node kinds — `operator_signature` excludes itself by having no name, and the next grammar shuffle has less to break.
+
+The new grammar is better: constructors are named (`Point.Point`), and top-level functions get real `fn` chunks. The old one "occasionally fell through to line-window" on those, as the reference config admitted.
+
+### Why there is no fingerprint bump
+
+A grammar upgrade *can* change chunk boundaries, and that would be worse than it sounds: the sha cache keys on file content, which hasn't changed, so no file would be reprocessed and the new chunking would never land — the index would drift into a mixture as files were edited, silently.
+
+So it was measured rather than assumed. This repository and a 6702-chunk project were indexed with both binaries into separate collections and their `chunk_uuid` sets compared — a chunk id is `uuid5(path | line range | sha of text)`, so identical ids mean identical chunking:
+
+| corpus | result |
+|---|---|
+| Rust (tree-sitter), markdown, toml — 21 files | every id identical |
+| Python (tree-sitter) — 7 files, 79 chunks | every id identical |
+
+**Not covered:** C++, Go, Java, JavaScript, TypeScript — no corpus was available. **Dart definitely changed**, so anyone who has enabled `[chunking.per_language.dart] strategy = "tree-sitter"` should `clear` and reindex; the reference config ships it commented out.
+
 ## 2026-08-16 — v0.0.8
 
 ### The batcher derives its ceilings instead of asserting them
