@@ -109,22 +109,40 @@ easy to help prose by handicapping code.
 
 ## 3. Measure the retrieval constants that are still guesses
 
-**Status:** mechanical; may well conclude "current values are correct".
+**Status:** `dense_k` and `sparse_k` measured — no effect. Others still open.
 
-`dense_k`, `sparse_k`, `rerank_top_n`, `PATH_FILTER_OVERSAMPLE` and
-`MAX_RETRIEVAL_K` were all chosen by argument. `eval/run.py --sweep` exists
-precisely for this.
+### dense_k / sparse_k: depth is not a lever here
 
-Start with `dense_k` / `sparse_k`: they decide what enters the candidate pool
-at all, and reranking has been measured to reorder that pool without ever
-adding to it. A constant that starves the pool cannot be rescued downstream.
+Swept 10 / 30 / 60 / 120 on a 6702-chunk project, cross-encoder off, three
+runs per point:
 
-Note this is the one entry that may produce no code. That is a legitimate
-outcome — "the defaults are right, and here is the evidence" is worth having
-written down.
+| value | recall@10 (dense_k) | recall@10 (sparse_k) |
+|---|---|---|
+| 10 | 0.886 | 0.886 |
+| 30 *(default)* | 0.886 | 0.886 |
+| 60 | 0.886 | 0.886 |
+| 120 | 0.886 | 0.886 |
 
-**Cost:** roughly 20 minutes per sweep point on a 6702-chunk corpus, less on
-a small one but correspondingly less informative.
+Identical at every depth on both legs. `recall@5` oscillated by one query
+with no trend, and the MRR bands overlap — see the run-to-run spread note
+in `eval/README.md` before reading anything into those.
+
+So the defaults are fine, and more usefully: **the four queries that miss
+are missing at any depth.** They are not absent from the candidate pool,
+they are ranked below it — the same conclusion the `docs` investigation
+reached from the other direction. Widening retrieval cannot fix them; only
+scoring can.
+
+### Still unmeasured
+
+- `rerank_top_n` — only meaningful with the cross-encoder on, so each point
+  costs a full slow run and inherits the reranker's own noise. Needs
+  `--repeat` and patience.
+- `PATH_FILTER_OVERSAMPLE` and `MAX_RETRIEVAL_K` — not reachable from
+  config (they are `const` in `search.rs`), and **no query in either set
+  uses a `path` filter**, so there is nothing to measure them against yet.
+  Add path-scoped queries first, then decide whether to make the constants
+  configurable or to sweep them by rebuilding.
 
 ---
 

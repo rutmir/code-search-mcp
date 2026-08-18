@@ -64,6 +64,43 @@ Queries run sequentially on purpose: the reference llama.cpp servers use
 `--parallel 1`, so concurrent queries would queue and make the latency
 numbers meaningless.
 
+## Results move on their own — measure the spread
+
+Six identical runs against a 6702-chunk project, cross-encoder disabled so
+there is no obviously random component:
+
+| metric | range over 6 runs |
+|---|---|
+| MRR | **0.0425** |
+| recall@1 | **0.0858** |
+| recall@5 | 0.0000 |
+| recall@10 | 0.0000 |
+
+Six of 35 queries were unstable, and every one flipped between two
+*adjacent* ranks — 1↔2, 4↔5, 7↔8. That is the signature of near-ties: the
+query embedding and Qdrant's approximate search vary just enough to swap
+neighbours. MRR punishes a 1↔2 swap by 0.5 and so inherits all of it;
+recall@5 and recall@10 only care about crossing a threshold and don't move
+at all.
+
+Two consequences, and they matter more than any single number this harness
+prints:
+
+- **Compare on recall@5 / recall@10 first.** They are stable. MRR is the
+  headline metric and the least trustworthy one.
+- **A single run cannot tell a small gain from a reshuffle.** `--repeat N`
+  runs the set N times and reports the median with its spread, and lists
+  every query whose rank varied. `--baseline` marks any delta that falls
+  inside the spread rather than letting you read a sign off it.
+
+```bash
+eval/run.py --config … --no-rerank --repeat 5
+eval/run.py --config … --repeat 3 --sweep search.dense_k=10,30,60,120
+```
+
+Without the cross-encoder a run is about 0.2 s per query, so repeats are
+nearly free — there is no reason to draw a conclusion from one.
+
 ## Writing a query set for your project
 
 `queries/code-search-mcp.toml` describes *this* repository. For another

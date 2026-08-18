@@ -275,12 +275,79 @@ def metrics(rows):
     return out
 
 
+def aggregate(runs):
+    """Median metrics across repeated runs, plus the spread of each.
+
+    Repeats are not a luxury. Measured on a 6702-chunk project, six
+    identical runs — cross-encoder disabled, so no obviously random
+    component — moved MRR over a range of 0.043 and recall@1 over 0.086,
+    while recall@5 and recall@10 did not move at all. Six of 35 queries
+    were unstable, every one of them flipping between two *adjacent*
+    ranks. That is the signature of near-ties: the query embedding and
+    Qdrant's approximate search vary just enough to swap neighbours, and
+    MRR punishes a 1↔2 swap by 0.5 while recall@5 shrugs.
+
+    So a single run cannot tell a small improvement from a reshuffle.
+    Report the spread and let the reader see which it is.
+    """
+    keys = ["mrr"] + [f"recall@{k}" for k in RECALL_AT]
+    if any("symbol_hit_rate" in m for m in runs):
+        keys.append("symbol_hit_rate")
+
+    out = dict(runs[0])
+    out["runs"] = len(runs)
+    out["spread"] = {}
+    for key in keys:
+        values = [m[key] for m in runs if key in m]
+        if not values:
+            continue
+        out[key] = round(statistics.median(values), 4)
+        out["spread"][key] = (round(min(values), 4), round(max(values), 4))
+
+    for cat in out.get("by_category", {}):
+        vals = [m["by_category"][cat]["mrr"] for m in runs if cat in m["by_category"]]
+        r10 = [m["by_category"][cat]["recall@10"] for m in runs if cat in m["by_category"]]
+        out["by_category"][cat]["mrr"] = round(statistics.median(vals), 4)
+        out["by_category"][cat]["recall@10"] = round(statistics.median(r10), 4)
+        out["by_category"][cat]["mrr_spread"] = (round(min(vals), 3), round(max(vals), 3))
+
+    lat = [m["latency_p50_ms"] for m in runs if "latency_p50_ms" in m]
+    if lat:
+        out["latency_p50_ms"] = round(statistics.median(lat), 1)
+    return out
+
+
+def unstable_queries(row_sets):
+    """Queries whose rank was not the same in every run — the ones whose
+    individual result means nothing on its own."""
+    if len(row_sets) < 2:
+        return []
+    out = []
+    for i in range(len(row_sets[0])):
+        ranks = {rs[i]["rank"] for rs in row_sets}
+        if len(ranks) > 1:
+            out.append(
+                {
+                    "q": row_sets[0][i]["q"],
+                    "category": row_sets[0][i]["category"],
+                    "ranks": sorted(r if r is not None else 99 for r in ranks),
+                }
+            )
+    return out
+
+
 def print_report(m, rows, title):
+    def spread(key):
+        s = m.get("spread", {}).get(key)
+        return f"   [{s[0]:.4f}–{s[1]:.4f}]" if s and s[1] > s[0] else ""
+
     print(f"\n=== {title} ===")
-    print(f"queries          {m['queries']}")
-    print(f"MRR              {m['mrr']:.4f}")
+    runs = m.get("runs", 1)
+    print(f"queries          {m['queries']}" + (f"   ({runs} runs, median shown)" if runs > 1 else ""))
+    print(f"MRR              {m['mrr']:.4f}{spread('mrr')}")
     for k in RECALL_AT:
-        print(f"recall@{k:<10} {m[f'recall@{k}']:.4f}")
+        key = f"recall@{k}"
+        print(f"recall@{k:<10} {m[key]:.4f}{spread(key)}")
     if "symbol_hit_rate" in m:
         print(f"symbol hit rate  {m['symbol_hit_rate']:.4f}")
     print(f"found via        {m['found_via']}")
@@ -305,11 +372,27 @@ def print_delta(base, new):
     keys = ["mrr"] + [f"recall@{k}" for k in RECALL_AT]
     if "symbol_hit_rate" in base and "symbol_hit_rate" in new:
         keys.append("symbol_hit_rate")
+    noisy = False
     for key in keys:
         b, n = base.get(key, 0.0), new.get(key, 0.0)
         d = n - b
         arrow = "→" if abs(d) < 1e-9 else ("↑" if d > 0 else "↓")
-        print(f"  {key:<16} {b:.4f} → {n:.4f}  {arrow} {d:+.4f}")
+        # A delta no bigger than the spread either side of it is a
+        # reshuffle, not a result. Saying so beats letting the reader
+        # read a sign off a number that could go the other way next run.
+        widest = max(
+            (s[1] - s[0])
+            for m in (base, new)
+            for s in [m.get("spread", {}).get(key, (0.0, 0.0))]
+        )
+        within = abs(d) <= widest and abs(d) > 1e-9
+        if within:
+            noisy = True
+        note = f"   (within run-to-run spread of {widest:.4f})" if within else ""
+        print(f"  {key:<16} {b:.4f} → {n:.4f}  {arrow} {d:+.4f}{note}")
+    if noisy:
+        print("\n  Deltas marked as within spread are not evidence. Re-run both")
+        print("  sides with --repeat to separate a real move from a reshuffle.")
     for key in ("latency_p50_ms", "latency_p95_ms"):
         if key in base and key in new:
             b, n = base[key], new[key]
@@ -378,6 +461,15 @@ def main():
     ap.add_argument("--binary", default=str(DEFAULT_BINARY))
     ap.add_argument("--limit", type=int, default=10, help="hits per query (recall ceiling)")
     ap.add_argument("--no-rerank", action="store_true", help="retrieval legs only; much faster")
+    ap.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        metavar="N",
+        help="run the set N times; report the median and the spread. Results are "
+        "not deterministic even without the cross-encoder, so a single run "
+        "cannot tell a small gain from a reshuffle",
+    )
     ap.add_argument("--set", action="append", default=[], metavar="section.key=value")
     ap.add_argument("--sweep", metavar="section.key=v1,v2,...", help="one run per value")
     ap.add_argument("--out", help="write results JSON here")
@@ -409,27 +501,50 @@ def main():
             table = []
             for value in values.split(","):
                 cfg = patch_config(config, args.set + [f"{key}={value}"], tmp)
-                print(f"\n--- {key}={value} ---", file=sys.stderr)
-                rows = evaluate(binary, cfg, queries, args.limit, args.no_rerank, cwd, args.verbose)
-                m = metrics(rows)
+                row_sets = []
+                for r in range(args.repeat):
+                    suffix = f" run {r + 1}/{args.repeat}" if args.repeat > 1 else ""
+                    print(f"\n--- {key}={value}{suffix} ---", file=sys.stderr)
+                    row_sets.append(
+                        evaluate(binary, cfg, queries, args.limit, args.no_rerank, cwd, args.verbose)
+                    )
+                m = aggregate([metrics(rs) for rs in row_sets])
                 table.append((value, m))
-                print_report(m, rows, f"{key}={value}")
+                print_report(m, row_sets[0], f"{key}={value}")
             print(f"\n=== sweep: {key} ===")
-            head = f"{'value':<12}{'MRR':>8}{'r@1':>8}{'r@5':>8}{'r@10':>8}{'p50 ms':>10}"
+            head = f"{'value':<12}{'MRR':>8}{'MRR spread':>22}{'r@5':>8}{'r@10':>8}{'p50 ms':>10}"
             print(head)
             print("-" * len(head))
             for value, m in table:
+                s = m.get("spread", {}).get("mrr")
+                band = f"[{s[0]:.4f}–{s[1]:.4f}]" if s and s[1] > s[0] else ""
                 print(
-                    f"{value:<12}{m['mrr']:>8.4f}{m['recall@1']:>8.3f}"
+                    f"{value:<12}{m['mrr']:>8.4f}{band:>22}"
                     f"{m['recall@5']:>8.3f}{m['recall@10']:>8.3f}"
                     f"{m.get('latency_p50_ms', 0):>10.1f}"
                 )
+            if args.repeat > 1:
+                print("\nCompare on recall@5 / recall@10 first — MRR's band shows how")
+                print("much of any difference between two rows could be a reshuffle.")
             return
 
         cfg = patch_config(config, args.set, tmp)
-        rows = evaluate(binary, cfg, queries, args.limit, args.no_rerank, cwd, args.verbose)
-        m = metrics(rows)
+        row_sets = []
+        for r in range(args.repeat):
+            if args.repeat > 1:
+                print(f"\n--- run {r + 1}/{args.repeat} ---", file=sys.stderr)
+            row_sets.append(
+                evaluate(binary, cfg, queries, args.limit, args.no_rerank, cwd, args.verbose)
+            )
+        rows = row_sets[0]
+        m = aggregate([metrics(rs) for rs in row_sets])
         print_report(m, rows, "results")
+
+        shaky = unstable_queries(row_sets)
+        if shaky:
+            print(f"\nunstable across runs ({len(shaky)}/{len(rows)}) — treat individually:")
+            for u in shaky:
+                print(f"  ranks {u['ranks']}  [{u['category']}] {u['q'][:56]}")
 
         if args.baseline:
             with open(args.baseline) as f:
