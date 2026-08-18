@@ -107,10 +107,13 @@ impl Chunker {
                     "go" => TreeSitterChunker::new_go(max_chars, fallback)?,
                     "csharp" => TreeSitterChunker::new_csharp(max_chars, fallback)?,
                     "java" => TreeSitterChunker::new_java(max_chars, fallback)?,
+                    "kotlin" => TreeSitterChunker::new_kotlin(max_chars, fallback)?,
+                    "swift" => TreeSitterChunker::new_swift(max_chars, fallback)?,
                     other => anyhow::bail!(
                         "tree-sitter strategy not supported for language '{}' \
                          (supported: 'rust', 'python', 'dart', 'cpp', \
-                         'typescript', 'javascript', 'go', 'csharp', 'java')",
+                         'typescript', 'javascript', 'go', 'csharp', 'java', \
+                         'kotlin', 'swift')",
                         other
                     ),
                 };
@@ -459,6 +462,8 @@ pub enum LangId {
     Go,
     CSharp,
     Java,
+    Kotlin,
+    Swift,
 }
 
 impl TreeSitterChunker {
@@ -559,6 +564,28 @@ impl TreeSitterChunker {
         Ok(Self {
             max_chars,
             lang_id: LangId::Java,
+            language,
+            fallback,
+        })
+    }
+
+    pub fn new_kotlin(max_chars: usize, fallback: LineChunker) -> Result<Self> {
+        assert!(max_chars > 0);
+        let language = tree_sitter_kotlin_ng::LANGUAGE.into();
+        Ok(Self {
+            max_chars,
+            lang_id: LangId::Kotlin,
+            language,
+            fallback,
+        })
+    }
+
+    pub fn new_swift(max_chars: usize, fallback: LineChunker) -> Result<Self> {
+        assert!(max_chars > 0);
+        let language = tree_sitter_swift::LANGUAGE.into();
+        Ok(Self {
+            max_chars,
+            lang_id: LangId::Swift,
             language,
             fallback,
         })
@@ -680,6 +707,8 @@ impl TreeSitterChunker {
             LangId::Go => self.emit_go_node(source, node, path, parent_type, out),
             LangId::CSharp => self.emit_csharp_node(source, node, path, parent_type, out),
             LangId::Java => self.emit_java_node(source, node, path, parent_type, out),
+            LangId::Kotlin => self.emit_kotlin_node(source, node, path, parent_type, out),
+            LangId::Swift => self.emit_swift_node(source, node, path, parent_type, out),
         }
     }
 
@@ -1451,6 +1480,140 @@ impl TreeSitterChunker {
 
     /// Emit ONE chunk for the given node, splitting it via the line
     /// fallback if it exceeds max_chars.
+    /// Kotlin emitter. `tree-sitter-kotlin-ng` folds class, interface and
+    /// `enum class` into a single `class_declaration`, so the keyword is
+    /// recovered from the node's own tokens — an `interface Foo` anchor
+    /// carries more than a generic `class Foo`.
+    ///
+    /// Known limitation: the grammar mis-parses *single-line* brace bodies
+    /// (`interface A { fun f() }`, `companion object { val x = 1 }`) while
+    /// handling the multi-line forms real code uses. `chunk` keeps a
+    /// best-effort tree on error, so such a construct loses itself rather
+    /// than the whole file.
+    fn emit_kotlin_node(
+        &self,
+        source: &[u8],
+        node: tree_sitter::Node,
+        path: &Path,
+        parent_type: Option<String>,
+        out: &mut Vec<Chunk>,
+    ) {
+        match node.kind() {
+            "class_declaration" => {
+                let name = field_text(source, node, "name");
+                let kind = kotlin_declaration_keyword(node).unwrap_or("class");
+                self.emit_one(source, node, path, kind, name.clone(), out);
+                self.emit_kotlin_members(source, node, path, name, out);
+            }
+            "object_declaration" => {
+                let name = field_text(source, node, "name");
+                self.emit_one(source, node, path, "object", name.clone(), out);
+                self.emit_kotlin_members(source, node, path, name, out);
+            }
+            "function_declaration" => {
+                let name = field_text(source, node, "name");
+                let qualified = match (parent_type, name) {
+                    (Some(owner), Some(f)) => Some(format!("{}.{}", owner, f)),
+                    (None, Some(f)) => Some(f),
+                    _ => None,
+                };
+                let kind = if qualified.as_deref().is_some_and(|s| s.contains('.')) {
+                    "method"
+                } else {
+                    "fn"
+                };
+                self.emit_one(source, node, path, kind, qualified, out);
+            }
+            "property_declaration" if parent_type.is_none() => {
+                let name = field_text(source, node, "name");
+                self.emit_one(source, node, path, "property", name, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// Walk a Kotlin type's body, emitting its functions as methods. A
+    /// `companion object` is descended into rather than emitted, so its
+    /// factory functions land as `Type.make` where a reader expects them.
+    fn emit_kotlin_members(
+        &self,
+        source: &[u8],
+        node: tree_sitter::Node,
+        path: &Path,
+        owner: Option<String>,
+        out: &mut Vec<Chunk>,
+    ) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if !matches!(child.kind(), "class_body" | "enum_class_body") {
+                continue;
+            }
+            let mut body = child.walk();
+            for member in child.children(&mut body) {
+                match member.kind() {
+                    "function_declaration" => {
+                        self.emit_kotlin_node(source, member, path, owner.clone(), out)
+                    }
+                    "companion_object" => {
+                        self.emit_kotlin_members(source, member, path, owner.clone(), out)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Swift emitter. The grammar is unusually helpful here: struct, class,
+    /// enum and extension all arrive as `class_declaration` carrying a
+    /// `declaration_kind` field with the actual keyword, so the chunk kind
+    /// is read off the source rather than guessed.
+    fn emit_swift_node(
+        &self,
+        source: &[u8],
+        node: tree_sitter::Node,
+        path: &Path,
+        parent_type: Option<String>,
+        out: &mut Vec<Chunk>,
+    ) {
+        match node.kind() {
+            "class_declaration" | "protocol_declaration" => {
+                let name = field_text(source, node, "name");
+                let kind = field_text(source, node, "declaration_kind");
+                let kind = kind.as_deref().unwrap_or("class");
+                // `extension Int` has no name of its own beyond the type it
+                // extends, which `name` already holds.
+                self.emit_one(source, node, path, kind, name.clone(), out);
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut cursor = body.walk();
+                    for member in body.children(&mut cursor) {
+                        self.emit_swift_node(source, member, path, name.clone(), out);
+                    }
+                }
+            }
+            "function_declaration" | "protocol_function_declaration" | "init_declaration" => {
+                let name = field_text(source, node, "name").or_else(|| {
+                    if node.kind() == "init_declaration" {
+                        Some("init".to_string())
+                    } else {
+                        None
+                    }
+                });
+                let qualified = match (parent_type, name) {
+                    (Some(owner), Some(f)) => Some(format!("{}.{}", owner, f)),
+                    (None, Some(f)) => Some(f),
+                    _ => return,
+                };
+                let kind = if qualified.as_deref().is_some_and(|s| s.contains('.')) {
+                    "method"
+                } else {
+                    "fn"
+                };
+                self.emit_one(source, node, path, kind, qualified, out);
+            }
+            _ => {}
+        }
+    }
+
     fn emit_one(
         &self,
         source: &[u8],
@@ -1502,6 +1665,30 @@ impl TreeSitterChunker {
 
 /// Extract the UTF-8 text of `node`'s `field` (by field name). Returns
 /// None if the field is missing or non-UTF-8.
+/// Which keyword introduced a Kotlin `class_declaration`. The grammar uses
+/// one node kind for `class`, `interface` and `enum class`, and exposes the
+/// keyword only as an anonymous token, so it is read from the children.
+fn kotlin_declaration_keyword(node: tree_sitter::Node) -> Option<&'static str> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "interface" => return Some("interface"),
+            "class" => return Some("class"),
+            // `enum class E` puts the keyword under a `modifiers` node.
+            "modifiers" => {
+                let mut m = child.walk();
+                for modifier in child.children(&mut m) {
+                    if modifier.kind() == "class_modifier" {
+                        return Some("enum");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn field_text(source: &[u8], node: tree_sitter::Node, field: &str) -> Option<String> {
     let n = node.child_by_field_name(field)?;
     let bytes = source.get(n.start_byte()..n.end_byte())?;
@@ -2276,6 +2463,110 @@ class Counter {
             "no Counter.* methods in {:?}",
             methods
         );
+    }
+
+    fn ts_kotlin() -> TreeSitterChunker {
+        TreeSitterChunker::new_kotlin(8000, LineChunker::new(80, 15, 8000)).unwrap()
+    }
+
+    fn ts_swift() -> TreeSitterChunker {
+        TreeSitterChunker::new_swift(8000, LineChunker::new(80, 15, 8000)).unwrap()
+    }
+
+    #[test]
+    fn ts_kotlin_class_interface_and_object() {
+        // One grammar node covers all three, so the keyword has to be
+        // recovered from the tokens — a wrong anchor here is worse than
+        // none, since `interface Api` and `class Api` mean different things.
+        let src = "\
+class Counter(var value: Int) {
+    fun increment() {
+        value++
+    }
+}
+
+interface Api {
+    fun call(): Int
+}
+
+object Registry {
+    fun lookup(): Int = 1
+}
+";
+        let c = ts_kotlin();
+        let chunks = c.chunk(src, &p());
+        let got: Vec<(&str, &str)> = chunks
+            .iter()
+            .filter_map(|c| Some((c.kind.as_deref()?, c.name.as_deref()?)))
+            .collect();
+        assert!(got.contains(&("class", "Counter")), "{got:?}");
+        assert!(got.contains(&("interface", "Api")), "{got:?}");
+        assert!(got.contains(&("object", "Registry")), "{got:?}");
+        assert!(got.contains(&("method", "Counter.increment")), "{got:?}");
+        assert!(got.contains(&("method", "Api.call")), "{got:?}");
+    }
+
+    #[test]
+    fn ts_kotlin_top_level_and_companion() {
+        // A companion object is descended into rather than emitted, so its
+        // factory shows up where a reader looks for it: on the type.
+        let src = "\
+fun topLevel(): Int = 42
+
+class Service {
+    companion object {
+        fun create(): Service = Service()
+    }
+}
+";
+        let c = ts_kotlin();
+        let chunks = c.chunk(src, &p());
+        let got: Vec<(&str, &str)> = chunks
+            .iter()
+            .filter_map(|c| Some((c.kind.as_deref()?, c.name.as_deref()?)))
+            .collect();
+        assert!(got.contains(&("fn", "topLevel")), "{got:?}");
+        assert!(got.contains(&("method", "Service.create")), "{got:?}");
+    }
+
+    #[test]
+    fn ts_swift_struct_class_protocol_extension() {
+        // The grammar hands over the keyword in a `declaration_kind` field,
+        // so struct/class/enum/extension keep their real anchor instead of
+        // collapsing into "class".
+        let src = "\
+struct Point {
+    var x: Int
+    func move(by d: Int) {
+        x += d
+    }
+}
+
+protocol Drawable {
+    func draw()
+}
+
+extension Int {
+    func doubled() -> Int {
+        self * 2
+    }
+}
+
+func topLevel() -> Int {
+    42
+}
+";
+        let c = ts_swift();
+        let chunks = c.chunk(src, &p());
+        let got: Vec<(&str, &str)> = chunks
+            .iter()
+            .filter_map(|c| Some((c.kind.as_deref()?, c.name.as_deref()?)))
+            .collect();
+        assert!(got.contains(&("struct", "Point")), "{got:?}");
+        assert!(got.contains(&("method", "Point.move")), "{got:?}");
+        assert!(got.contains(&("protocol", "Drawable")), "{got:?}");
+        assert!(got.contains(&("extension", "Int")), "{got:?}");
+        assert!(got.contains(&("fn", "topLevel")), "{got:?}");
     }
 
     #[test]

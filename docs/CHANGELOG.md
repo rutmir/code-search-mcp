@@ -2,6 +2,18 @@
 
 History of significant changes. Newest at the top. Dates are when work landed locally; this project doesn't tag releases yet.
 
+## 2026-08-18 — v0.1.0
+
+### Kotlin and Swift are AST-chunked
+
+Both had language buckets since v0.0.5 but were line-chunked; now they have real emitters, bringing tree-sitter coverage to eleven languages. Enable per project with `[chunking.per_language.kotlin] strategy = "tree-sitter"` (likewise `swift`) — nothing changes for an existing index until you do.
+
+**Kotlin** keeps `class`, `interface`, `object` and `enum class` distinct, which the grammar does not do for you: all four arrive as one `class_declaration`, so the keyword is recovered from the node's tokens. An `interface Api` anchor says something a generic `class Api` does not. Methods are qualified `Type.method`, and a `companion object` is descended into rather than emitted, so a factory lands as `Service.create` where a reader looks for it.
+
+**Swift** is easier — the grammar reports the keyword in a `declaration_kind` field — so `struct`, `class`, `enum`, `protocol` and `extension` each keep their own anchor rather than collapsing into "class". Methods, initializers and protocol requirements are qualified `Type.member`.
+
+Two notes on the Kotlin crate. `tree-sitter-kotlin` 0.3 is unusable: it still targets tree-sitter 0.20, and cargo "resolves" that by linking a second copy of the parser, which then fails to typecheck against the 0.25 types — the dependency graph looked fine right up until it didn't. The maintained `tree-sitter-kotlin-ng` is used instead. And that grammar mis-parses *single-line* brace bodies (`interface A { fun f() }`, `companion object { val x = 1 }`) while handling the multi-line forms real code is written in; the chunker keeps a best-effort tree on a parse error, so such a construct loses itself rather than the whole file.
+
 ## 2026-08-18 — v0.0.9
 
 ### tree-sitter 0.22 → 0.25, and every grammar with it

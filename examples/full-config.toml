@@ -26,7 +26,7 @@ root = "."
 #                             "javascript" "go" "csharp" "java"
 #   structured-text:          "markdown" "toml" "yaml" "json" "xml"
 #   build / manifest config:  "gradle" "properties"   (Android/JVM projects)
-#   line-chunked languages:   "kotlin" "swift"        (no grammar wired up yet)
+#   tree-sitter, also:        "kotlin" "swift"
 #   plain-text bucket:        "shell" "systemd" "env" "text"
 # `xml` covers AndroidManifest.xml + res/values/*.xml; `gradle` covers
 # build.gradle / settings.gradle / build.gradle.kts; `properties` covers
@@ -278,5 +278,23 @@ max_chunk_chars = 8000
 # Java override (extensions java). class / interface / enum / record /
 # annotation with method ClassName.method_name for methods + constructors.
 # [chunking.per_language.java]
+# strategy = "tree-sitter"
+# max_chunk_chars = 8000
+
+# Kotlin override (extensions kt). class / interface / object / enum class
+# each keep their own anchor, and methods are qualified `Type.method`. A
+# `companion object` is descended into rather than emitted, so factories
+# land on the type where you look for them. Note the grammar mis-parses
+# single-line brace bodies (`interface A { fun f() }`); the multi-line
+# forms real code uses are fine, and a bad construct loses only itself.
+# [chunking.per_language.kotlin]
+# strategy = "tree-sitter"
+# max_chunk_chars = 8000
+
+# Swift override (extensions swift). struct / class / enum / protocol /
+# extension keep their own keyword as the chunk kind — the grammar reports
+# it directly — with methods, initializers and protocol requirements
+# qualified `Type.member`.
+# [chunking.per_language.swift]
 # strategy = "tree-sitter"
 # max_chunk_chars = 8000

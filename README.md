@@ -12,7 +12,7 @@ When Claude Code explores a codebase to answer a question, it currently does it 
 `code-search-mcp` returns the final ranked list (typically ~1500 tokens of structured `file:line + symbol + preview`) from a single tool call. The hit rate matches or exceeds the iterative approach because:
 
 - **Hybrid retrieval** — dense semantic embeddings + sparse BM25 + cross-encoder reranking together outperform any single signal
-- **AST-aware chunking** — chunks aligned to function / class / method boundaries via tree-sitter for 9 languages; the LLM sees `fn AdaptiveBatcher::note_failure` headers, not raw line ranges
+- **AST-aware chunking** — chunks aligned to function / class / method boundaries via tree-sitter for 11 languages; the LLM sees `fn AdaptiveBatcher::note_failure` headers, not raw line ranges
 - **Code-aware matching** — the BM25 tokenizer splits snake_case / camelCase identifiers (`buildSiPortfolio` finds `build_si_portfolio`), and a query that literally names a symbol boosts that chunk to the top — exact-symbol lookups don't need grep
 - **Quality-first defaults** — recall is the lever, latency is not. A 2-minute search that finds the right answer beats a 10-second search that misses
 
@@ -238,7 +238,8 @@ A complete annotated example with every knob explained lives at `examples/full-c
 | `csharp` | tree-sitter | `Class.method` | namespaces descend without standalone emission |
 | `java` | tree-sitter | `Class.method` | classes / interfaces / enums / records / annotations |
 | `markdown` | headings | n/a | H1/H2 cuts, fenced-block aware |
-| `kotlin`, `swift` | lines | n/a | own bucket so they're whitelistable and filterable; no grammar wired up yet |
+| `kotlin` | tree-sitter | `Class.method` | class / interface / object / enum kept distinct; companion objects folded onto the type |
+| `swift` | tree-sitter | `Type.method` | struct / class / enum / protocol / extension keep their own keyword |
 | `toml`, `yaml`, `json` | lines (default) | n/a | structured config |
 | `shell`, `systemd`, `env`, `text` | lines | n/a | catch-all for `*.sh`, `*.service`, `*.env`, `*.ini`, `*.cfg`, `*.conf`, `*.example`, `*.local` |
 

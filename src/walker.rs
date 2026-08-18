@@ -298,11 +298,8 @@ fn extensions_for_language(lang: &str) -> &'static [&'static str] {
         // `properties` covers gradle.properties / gradle-wrapper.properties.
         "gradle" => &["gradle", "kts"],
         "properties" => &["properties"],
-        // Kotlin and Swift have no tree-sitter grammar wired up yet, so
-        // they're line-chunked. They still get their own bucket rather
-        // than falling into `text`: an Android or iOS project must be able
-        // to name its primary language in an `[index].languages`
-        // whitelist, and `lang = "kotlin"` must be a usable search filter.
+        // AST-aware since v0.1.0 (tree-sitter-kotlin-ng / tree-sitter-swift);
+        // enable with `[chunking.per_language.<lang>] strategy = "tree-sitter"`.
         "kotlin" => &["kt"],
         "swift" => &["swift"],
         // Plain-text-ish formats. No tree-sitter for these — the line
