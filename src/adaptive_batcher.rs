@@ -8,7 +8,12 @@
 //!      - After [`INCREASE_THRESHOLD`] consecutive successes, +25%
 //!        (multiplicative — fast probe upward).
 //!      - On any failure, ÷2 (multiplicative decrease).
-//!      - Bounded by [`MIN_BUDGET`, `MAX_BUDGET`].
+//!      - Bounded below by [`MIN_BUDGET`], above by whichever is smaller:
+//!        [`MAX_BUDGET`] (a memory-pressure bound) or the work that fits
+//!        in [`TARGET_BATCH_SECS`] at the observed throughput. The second
+//!        is the one that matters on a slow host: without it the budget
+//!        climbs to a size that host can never finish in time, times out,
+//!        halves, and climbs again — a full timeout burnt per cycle.
 //!
 //!    A failure also arms a one-shot **retry ceiling** at half the size of
 //!    the batch that actually failed. Halving the budget alone does not
@@ -25,6 +30,18 @@
 //!    estimate (~500 chars/s, lower bound on CPU jina-code) until we have
 //!    a real measurement.
 //!
+//!    That timeout is kept strictly shorter than the transport's own hard
+//!    cap (`[embedding].timeout_secs`). When the two can both fire — as
+//!    they could when both were 300 s — a slow batch and a dead connection
+//!    arrive as the same error, and the batcher shrinks the budget over
+//!    what was really a wrong estimate of how long the server takes.
+//!
+//!    A timeout also feeds *back* into the estimate: a batch that did not
+//!    finish in `elapsed` proves the server is slower than
+//!    `chars / elapsed`, so the EWMA is corrected downward. Halving alone
+//!    is forgotten after five successes; a corrected estimate lowers the
+//!    derived budget ceiling for good.
+//!
 //! Modeled after TCP congestion control: small failure cost in exchange for
 //! never needing static configuration of server capacity *or* throughput.
 
@@ -36,10 +53,25 @@ use tracing::{debug, warn};
 /// with a WARN.
 pub const MIN_BUDGET: usize = 1024;
 
-/// Upper bound on the budget. Even if the server is happy with bigger
-/// payloads, we cap here to keep individual requests timely and bound
-/// memory pressure on both ends.
+/// Absolute upper bound on the budget, regardless of how fast the server
+/// turns out to be. This one is about memory pressure on both ends, not
+/// about capacity — capacity is derived (see [`AdaptiveBatcher::budget_ceiling`]).
 pub const MAX_BUDGET: usize = 256_000;
+
+/// How long a single embedding request should aim to take, whatever the
+/// host. This is a policy choice, not a claim about any server: it fixes
+/// how much work is lost when a batch fails and how coarse progress
+/// reporting is, and those should not differ between a laptop and a GPU
+/// box. The budget ceiling is derived from it and the observed
+/// throughput, which is what stops the budget climbing to a size the host
+/// could never finish in time.
+const TARGET_BATCH_SECS: f64 = 30.0;
+
+/// Fraction of the transport's hard timeout that the batcher's own
+/// per-request timeout may use. Keeping our timeout strictly the shorter
+/// one means a slow batch fails as "this batch was too big for the time
+/// we gave it" rather than as an indistinguishable transport error.
+const TIMEOUT_HEADROOM: f64 = 0.9;
 
 /// Successful batches in a row before we try growing the budget.
 const INCREASE_THRESHOLD: u32 = 5;
@@ -65,10 +97,6 @@ const TIMEOUT_BASE_SECS: f64 = 10.0;
 /// Per-request timeout never goes below this — even a tiny request needs
 /// enough headroom for the server to actually pick it up.
 const TIMEOUT_FLOOR_SECS: f64 = 15.0;
-/// Per-request timeout never goes above this. Beyond this, the bottleneck
-/// is almost always something we can't time-our-way-out-of (real hang,
-/// crash); AIMD halving the batch is the better response.
-const TIMEOUT_CEILING_SECS: f64 = 300.0;
 
 pub struct AdaptiveBatcher {
     budget: usize,
@@ -81,20 +109,54 @@ pub struct AdaptiveBatcher {
     /// by the next success. Caps [`pack`] in addition to the budget, which
     /// is what makes a retry strictly smaller than what just failed.
     retry_ceiling: Option<usize>,
+    /// The transport's hard timeout (`[embedding].timeout_secs`). The
+    /// batcher needs to know it so its own derived timeout can stay
+    /// strictly shorter; when the two are equal — as they were, both 300 —
+    /// whichever fires is a coin toss, and a transport error and an
+    /// oversized batch become indistinguishable at the point where the
+    /// batcher decides what to shrink.
+    request_timeout: Duration,
 }
 
 impl AdaptiveBatcher {
-    pub fn new(initial: usize) -> Self {
+    pub fn new(initial: usize, request_timeout: Duration) -> Self {
         Self {
             budget: initial.clamp(MIN_BUDGET, MAX_BUDGET),
             consecutive_ok: 0,
             chars_per_sec: None,
             retry_ceiling: None,
+            request_timeout,
         }
     }
 
     pub fn budget(&self) -> usize {
         self.budget
+    }
+
+    /// Longest per-request timeout the batcher will ask for: a fraction of
+    /// the transport's hard cap, so ours always fires first.
+    fn timeout_ceiling_secs(&self) -> f64 {
+        self.request_timeout.as_secs_f64() * TIMEOUT_HEADROOM
+    }
+
+    /// Largest budget worth having on *this* host, derived from observed
+    /// throughput rather than assumed.
+    ///
+    /// Without it the budget grows +25% per five successes toward a fixed
+    /// 256 KB. On a CPU-bound server that size cannot finish inside any
+    /// sane timeout, so the loop climbed to the cap, timed out, halved,
+    /// and climbed again — paying a full timeout per cycle, indefinitely.
+    /// Observed doing exactly that through a multi-hour reindex.
+    ///
+    /// The fix is not a smaller constant, which would merely move the
+    /// problem to a faster machine. Once throughput is known, the ceiling
+    /// is the work that fits in [`TARGET_BATCH_SECS`]; until then the
+    /// absolute cap stands and AIMD probes as before.
+    fn budget_ceiling(&self) -> usize {
+        match self.chars_per_sec {
+            Some(cps) => ((cps * TARGET_BATCH_SECS) as usize).clamp(MIN_BUDGET, MAX_BUDGET),
+            None => MAX_BUDGET,
+        }
     }
 
     /// Ceiling in force for the next batch, when a failure has armed one.
@@ -121,13 +183,17 @@ impl AdaptiveBatcher {
     }
 
     /// Estimate a per-request timeout based on observed (or bootstrap)
-    /// throughput. Floors at [`TIMEOUT_FLOOR_SECS`], ceils at
-    /// [`TIMEOUT_CEILING_SECS`].
+    /// throughput. Floors at [`TIMEOUT_FLOOR_SECS`], and never reaches the
+    /// transport's hard cap — see [`timeout_ceiling_secs`].
     pub fn estimate_timeout(&self, batch_chars: usize) -> Duration {
         let cps = self.chars_per_sec.unwrap_or(BOOTSTRAP_CHARS_PER_SEC);
         let estimated_secs = batch_chars as f64 / cps;
         let secs = TIMEOUT_BASE_SECS + TIMEOUT_SAFETY_FACTOR * estimated_secs;
-        Duration::from_secs_f64(secs.clamp(TIMEOUT_FLOOR_SECS, TIMEOUT_CEILING_SECS))
+        let ceiling = self.timeout_ceiling_secs();
+        // A tiny configured timeout can put the ceiling below the floor;
+        // the ceiling wins, since exceeding it guarantees the transport
+        // kills the request first and we learn nothing.
+        Duration::from_secs_f64(secs.clamp(TIMEOUT_FLOOR_SECS.min(ceiling), ceiling))
     }
 
     /// Pick the next batch from `texts[start..]`, returning the exclusive
@@ -167,12 +233,13 @@ impl AdaptiveBatcher {
         });
 
         self.consecutive_ok = self.consecutive_ok.saturating_add(1);
-        if self.consecutive_ok >= INCREASE_THRESHOLD && self.budget < MAX_BUDGET {
+        let ceiling = self.budget_ceiling();
+        if self.consecutive_ok >= INCREASE_THRESHOLD && self.budget < ceiling {
             let new = ((self.budget as f64) * INCREASE_FACTOR) as usize;
-            let new = new.clamp(self.budget + 1, MAX_BUDGET);
+            let new = new.clamp(self.budget + 1, ceiling);
             debug!(
                 old = self.budget,
-                new, "adaptive batcher: increasing budget"
+                new, ceiling, "adaptive batcher: increasing budget"
             );
             self.budget = new;
             self.consecutive_ok = 0;
@@ -190,8 +257,31 @@ impl AdaptiveBatcher {
     ///
     /// The budget will not go below [`MIN_BUDGET`]; at the floor the caller
     /// treats a single oversized chunk as unembeddable.
-    pub fn note_failure(&mut self, failed_batch_chars: usize) -> usize {
+    pub fn note_failure(&mut self, failed_batch_chars: usize, elapsed: Duration) -> usize {
         self.consecutive_ok = 0;
+
+        // A batch that ran out of time is evidence about *throughput*, not
+        // only about size: it demonstrably did not finish in `elapsed`, so
+        // the server is slower than `chars / elapsed`. Folding that in is
+        // what keeps the budget from climbing back to a level this host was
+        // never capable of — halving alone is forgotten after five
+        // successes, while a corrected estimate lowers the derived ceiling
+        // for good.
+        //
+        // Self-guarding for the other failure modes: a batch rejected
+        // outright (4xx, "input too large") comes back in milliseconds, so
+        // the implied bound is enormous and the estimate is left alone.
+        let secs = elapsed.as_secs_f64().max(0.001);
+        let implied_max = failed_batch_chars as f64 / secs;
+        if self.chars_per_sec.is_none_or(|cps| cps > implied_max) {
+            debug!(
+                previous = ?self.chars_per_sec,
+                implied_max,
+                "adaptive batcher: timeout contradicts the throughput estimate; lowering it"
+            );
+            self.chars_per_sec = Some(implied_max);
+        }
+
         // At least 1: a ceiling of 0 would be meaningless, and `pack` always
         // takes one element regardless.
         let ceiling = (failed_batch_chars / 2).max(1);
@@ -216,12 +306,26 @@ impl AdaptiveBatcher {
 mod tests {
     use super::*;
 
+    /// The default `[embedding].timeout_secs`, which is what most of these
+    /// cases care about only indirectly.
+    const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+    /// An outright rejection comes back immediately; used where a test
+    /// means "this failed, but not by running out of time".
+    const FAST: Duration = Duration::from_millis(20);
+
+    impl AdaptiveBatcher {
+        fn new_for_test(initial: usize) -> Self {
+            Self::new(initial, TEST_REQUEST_TIMEOUT)
+        }
+    }
+
     #[test]
     fn pack_always_advances() {
         // Even when a single chunk dwarfs the budget, pack must include it
         // (otherwise the caller's loop would stall). Single chunks above
         // the budget are caught by the caller's failure path, not here.
-        let b = AdaptiveBatcher::new(MIN_BUDGET);
+        let b = AdaptiveBatcher::new_for_test(MIN_BUDGET);
         let huge = MIN_BUDGET * 10;
         let texts = vec!["x".repeat(huge)];
         assert_eq!(b.pack(&texts, 0), 1);
@@ -231,7 +335,7 @@ mod tests {
     fn pack_respects_budget() {
         // Budgets below MIN_BUDGET get clamped, so build the test above it.
         let budget = 5_000;
-        let b = AdaptiveBatcher::new(budget);
+        let b = AdaptiveBatcher::new_for_test(budget);
         let chunk_bytes = 2_000;
         let texts: Vec<String> = (0..10).map(|_| "x".repeat(chunk_bytes)).collect();
         // 2000-byte chunks, budget 5000 → 2 fit (2000+2000=4000; +2000 would be 6000).
@@ -240,7 +344,7 @@ mod tests {
 
     #[test]
     fn increase_after_threshold() {
-        let mut b = AdaptiveBatcher::new(10_000);
+        let mut b = AdaptiveBatcher::new_for_test(10_000);
         let initial = b.budget();
         for _ in 0..INCREASE_THRESHOLD {
             b.note_success(5_000, Duration::from_secs(10));
@@ -250,7 +354,7 @@ mod tests {
 
     #[test]
     fn throughput_ewma_updates() {
-        let mut b = AdaptiveBatcher::new(10_000);
+        let mut b = AdaptiveBatcher::new_for_test(10_000);
         assert!(b.chars_per_sec().is_none());
         b.note_success(10_000, Duration::from_secs(10)); // 1000 chars/s
         assert_eq!(b.chars_per_sec(), Some(1000.0));
@@ -262,7 +366,7 @@ mod tests {
 
     #[test]
     fn estimate_timeout_uses_bootstrap_when_unobserved() {
-        let b = AdaptiveBatcher::new(10_000);
+        let b = AdaptiveBatcher::new_for_test(10_000);
         // 10 KB with bootstrap 500 chars/s → 20s estimated, base 10s, ×3 safety = 70s.
         let t = b.estimate_timeout(10_000);
         assert!(t.as_secs() >= 60 && t.as_secs() <= 80, "got {:?}", t);
@@ -270,7 +374,7 @@ mod tests {
 
     #[test]
     fn estimate_timeout_uses_observed_throughput() {
-        let mut b = AdaptiveBatcher::new(10_000);
+        let mut b = AdaptiveBatcher::new_for_test(10_000);
         // Observed: 1000 chars/s (much faster than bootstrap).
         b.note_success(10_000, Duration::from_secs(10));
         // 10 KB at 1000 chars/s = 10s estimated, ×3 + 10 base = 40s.
@@ -280,14 +384,14 @@ mod tests {
 
     #[test]
     fn estimate_timeout_floors() {
-        let b = AdaptiveBatcher::new(10_000);
+        let b = AdaptiveBatcher::new_for_test(10_000);
         let t = b.estimate_timeout(0);
         assert!(t.as_secs() >= 15);
     }
 
     #[test]
     fn estimate_timeout_ceils() {
-        let mut b = AdaptiveBatcher::new(10_000);
+        let mut b = AdaptiveBatcher::new_for_test(10_000);
         b.note_success(1, Duration::from_secs(10)); // extremely slow: 0.1 chars/s
         let t = b.estimate_timeout(1_000_000);
         assert!(t.as_secs() <= 300);
@@ -295,15 +399,15 @@ mod tests {
 
     #[test]
     fn halve_on_failure() {
-        let mut b = AdaptiveBatcher::new(10_000);
-        b.note_failure(10_000);
+        let mut b = AdaptiveBatcher::new_for_test(10_000);
+        b.note_failure(10_000, FAST);
         assert_eq!(b.budget(), 5_000);
     }
 
     #[test]
     fn halve_floors_at_min() {
-        let mut b = AdaptiveBatcher::new(MIN_BUDGET);
-        b.note_failure(MIN_BUDGET);
+        let mut b = AdaptiveBatcher::new_for_test(MIN_BUDGET);
+        b.note_failure(MIN_BUDGET, FAST);
         assert_eq!(b.budget(), MIN_BUDGET);
     }
 
@@ -317,7 +421,7 @@ mod tests {
     fn retry_after_failure_is_strictly_smaller() {
         let chunk = 7_000;
         let texts: Vec<String> = (0..17).map(|_| "x".repeat(chunk)).collect();
-        let mut b = AdaptiveBatcher::new(256_000);
+        let mut b = AdaptiveBatcher::new_for_test(256_000);
 
         let end = b.pack(&texts, 0);
         assert_eq!(end, 17, "all chunks fit the initial budget");
@@ -327,7 +431,7 @@ mod tests {
             "precondition: the failing batch fits under the halved budget"
         );
 
-        b.note_failure(failed_chars);
+        b.note_failure(failed_chars, FAST);
         let retry_end = b.pack(&texts, 0);
         assert!(
             retry_end < end,
@@ -344,12 +448,12 @@ mod tests {
     #[test]
     fn repeated_failures_keep_shrinking() {
         let texts: Vec<String> = (0..64).map(|_| "x".repeat(4_000)).collect();
-        let mut b = AdaptiveBatcher::new(MAX_BUDGET);
+        let mut b = AdaptiveBatcher::new_for_test(MAX_BUDGET);
 
         let mut prev = b.pack(&texts, 0);
         for round in 0..6 {
             let chars: usize = texts[..prev].iter().map(|t| t.len()).sum();
-            b.note_failure(chars);
+            b.note_failure(chars, FAST);
             let next = b.pack(&texts, 0);
             assert!(
                 next <= prev,
@@ -370,8 +474,8 @@ mod tests {
     #[test]
     fn pack_advances_even_under_a_tight_ceiling() {
         let texts = vec!["x".repeat(50_000), "y".repeat(50_000)];
-        let mut b = AdaptiveBatcher::new(MAX_BUDGET);
-        b.note_failure(100);
+        let mut b = AdaptiveBatcher::new_for_test(MAX_BUDGET);
+        b.note_failure(100, FAST);
         assert_eq!(b.pack(&texts, 0), 1);
     }
 
@@ -381,9 +485,9 @@ mod tests {
     #[test]
     fn success_clears_the_retry_ceiling() {
         let texts: Vec<String> = (0..10).map(|_| "x".repeat(5_000)).collect();
-        let mut b = AdaptiveBatcher::new(MAX_BUDGET);
+        let mut b = AdaptiveBatcher::new_for_test(MAX_BUDGET);
 
-        b.note_failure(50_000);
+        b.note_failure(50_000, FAST);
         assert!(b.retry_ceiling().is_some());
         let constrained = b.pack(&texts, 0);
         assert!(constrained < 10);
@@ -394,9 +498,113 @@ mod tests {
         assert_eq!(b.pack(&texts, 0), 10);
     }
 
+    /// Feed the batcher `n` successes at a given throughput, as a real run
+    /// would, so the growth path and the EWMA both see it.
+    fn converge(b: &mut AdaptiveBatcher, chars_per_sec: f64, rounds: usize) {
+        for _ in 0..rounds {
+            let chars = b.budget();
+            let secs = chars as f64 / chars_per_sec;
+            b.note_success(chars, Duration::from_secs_f64(secs));
+        }
+    }
+
+    /// The regression this exists for: on a slow host the budget used to
+    /// climb to a fixed 256 KB, which that host cannot process inside any
+    /// sane timeout, so it timed out, halved, and climbed again forever.
+    #[test]
+    fn budget_stops_growing_at_what_the_host_can_actually_do() {
+        // ~450 chars/s is what the CPU-bound reference host measured.
+        let mut b = AdaptiveBatcher::new_for_test(10_000);
+        converge(&mut b, 450.0, 60);
+
+        let ceiling = (450.0 * TARGET_BATCH_SECS) as usize;
+        assert!(
+            b.budget() <= ceiling,
+            "budget {} exceeded the derived ceiling {}",
+            b.budget(),
+            ceiling
+        );
+        assert!(
+            b.budget() < MAX_BUDGET / 4,
+            "budget {} is still climbing toward the absolute cap",
+            b.budget()
+        );
+        // And a batch at that budget stays comfortably inside the timeout,
+        // which is the property whose absence caused the oscillation.
+        let t = b.estimate_timeout(b.budget()).as_secs_f64();
+        assert!(
+            t < b.timeout_ceiling_secs(),
+            "a full batch needs {t}s against a {}s ceiling",
+            b.timeout_ceiling_secs()
+        );
+    }
+
+    /// The same rule must not punish a fast host: there the absolute cap is
+    /// the binding one, exactly as before.
+    #[test]
+    fn fast_host_is_limited_only_by_the_absolute_cap() {
+        let mut b = AdaptiveBatcher::new_for_test(10_000);
+        converge(&mut b, 50_000.0, 80);
+        assert_eq!(b.budget(), MAX_BUDGET);
+    }
+
+    #[test]
+    fn derived_timeout_never_reaches_the_transport_cap() {
+        // Even an absurd batch against a crawling server must leave the
+        // transport's own timeout unused, so a failure is attributable.
+        let mut b = AdaptiveBatcher::new(MAX_BUDGET, Duration::from_secs(300));
+        b.note_success(1, Duration::from_secs(100)); // 0.01 chars/s
+        let t = b.estimate_timeout(10_000_000);
+        assert!(t < Duration::from_secs(300), "got {t:?}");
+        assert!((t.as_secs_f64() - 300.0 * TIMEOUT_HEADROOM).abs() < 1.0);
+    }
+
+    #[test]
+    fn tiny_configured_timeout_still_yields_a_usable_timeout() {
+        // Ceiling below the floor: the ceiling has to win, or every request
+        // is killed by the transport before our own timeout means anything.
+        let b = AdaptiveBatcher::new(10_000, Duration::from_secs(10));
+        let t = b.estimate_timeout(100_000);
+        assert!(t <= Duration::from_secs(9), "got {t:?}");
+        assert!(t > Duration::ZERO);
+    }
+
+    /// A timeout says something about throughput, not just about size. The
+    /// budget halving is forgotten after five successes; a corrected
+    /// estimate lowers the derived ceiling for good.
+    #[test]
+    fn a_timeout_corrects_the_throughput_estimate() {
+        let mut b = AdaptiveBatcher::new_for_test(100_000);
+        converge(&mut b, 5_000.0, 10);
+        let optimistic = b.chars_per_sec().unwrap();
+
+        // 100 000 chars still unfinished after 100 s ⇒ at most 1000 chars/s.
+        b.note_failure(100_000, Duration::from_secs(100));
+        let corrected = b.chars_per_sec().unwrap();
+        assert!(
+            corrected < optimistic,
+            "estimate stayed at {optimistic} after contradicting evidence"
+        );
+        assert!((corrected - 1_000.0).abs() < 1.0, "got {corrected}");
+    }
+
+    #[test]
+    fn an_outright_rejection_leaves_the_estimate_alone() {
+        // A 4xx comes back in milliseconds; the implied bound is enormous
+        // and says nothing about how fast the server embeds.
+        let mut b = AdaptiveBatcher::new_for_test(10_000);
+        converge(&mut b, 800.0, 10);
+        let before = b.chars_per_sec().unwrap();
+        b.note_failure(10_000, FAST);
+        assert_eq!(b.chars_per_sec().unwrap(), before);
+    }
+
     #[test]
     fn clamps_initial() {
-        assert_eq!(AdaptiveBatcher::new(0).budget(), MIN_BUDGET);
-        assert_eq!(AdaptiveBatcher::new(usize::MAX).budget(), MAX_BUDGET);
+        assert_eq!(AdaptiveBatcher::new_for_test(0).budget(), MIN_BUDGET);
+        assert_eq!(
+            AdaptiveBatcher::new_for_test(usize::MAX).budget(),
+            MAX_BUDGET
+        );
     }
 }

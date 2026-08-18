@@ -2,6 +2,22 @@
 
 History of significant changes. Newest at the top. Dates are when work landed locally; this project doesn't tag releases yet.
 
+## 2026-08-16 — v0.0.8
+
+### The batcher derives its ceilings instead of asserting them
+
+Two constants claimed to know a server they had never met, and both were wrong on a CPU-bound host.
+
+**The budget ceiling was fixed at 256 KB.** On a host doing ~450 chars/s that is roughly nine minutes of work for one request — unreachable inside any sane timeout. So the AIMD loop climbed to the cap, timed out, halved, climbed again, and paid a full timeout every cycle. It did exactly that repeatedly through the v0.0.5 rebuild.
+
+Lowering the constant would only move the problem onto a faster machine. The ceiling is now derived: once throughput is known, it is the work that fits in `TARGET_BATCH_SECS` (30 s). `MAX_BUDGET` survives as an absolute bound on memory pressure, which is what still limits a fast host. The remaining constants are policy — how long one request should take, how much of the transport timeout the batcher may use — not assertions about anyone's hardware.
+
+**The derived timeout could not fire first.** `TIMEOUT_CEILING_SECS` was 300 and the default `[embedding].timeout_secs` is also 300, so which of the two killed a slow request was a coin toss. A transport error and an oversized batch then arrive as the same failure, and the batcher shrinks the budget when what was actually wrong was its estimate of how long the server takes — something it could never learn, because the two are indistinguishable at the point of decision. The batcher now takes the transport cap as an input and keeps its own timeout strictly under it.
+
+**A timeout now corrects the throughput estimate.** A batch that did not finish in `elapsed` proves the server is slower than `chars / elapsed`; if the EWMA disagrees, it is lowered to that bound. Halving the budget is forgotten after five successes, whereas a corrected estimate lowers the derived ceiling for good. Self-guarding for other failures: an outright rejection returns in milliseconds, the implied bound is enormous, and the estimate is left alone.
+
+No configuration changes, and no reindex — `config_hard` is untouched.
+
 ## 2026-08-15 — v0.0.7
 
 ### The cross-encoder is skipped for bare symbol lookups

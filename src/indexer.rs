@@ -151,7 +151,10 @@ pub async fn run(config: &Config) -> Result<IndexStats> {
     // (now-advisory) max_input_chars set, use it as the starting hint;
     // AIMD will halve it down if it's too optimistic, grow it if conservative.
     let initial_budget = config.embedding.max_input_chars.unwrap_or(10_000);
-    let mut batcher = AdaptiveBatcher::new(initial_budget);
+    let mut batcher = AdaptiveBatcher::new(
+        initial_budget,
+        Duration::from_secs(config.embedding.timeout_secs),
+    );
     info!(
         initial_budget,
         min_budget = MIN_BUDGET,
@@ -621,7 +624,7 @@ async fn embed_with_adaptive_batching(
                             // the failing batch, so the next pack from the
                             // same start is strictly smaller.
                             let old = batcher.budget();
-                            let new = batcher.note_failure(batch_chars);
+                            let new = batcher.note_failure(batch_chars, send_started.elapsed());
                             warn!(
                                 batch_size = end - start,
                                 batch_chars,
@@ -652,7 +655,7 @@ async fn embed_with_adaptive_batching(
                             // Multi-chunk with a 4xx: somewhere in this batch
                             // is bad input. Shrink to bisect — the ceiling is
                             // what makes each pass actually narrow the search.
-                            let new = batcher.note_failure(batch_chars);
+                            let new = batcher.note_failure(batch_chars, send_started.elapsed());
                             warn!(
                                 batch_size = end - start,
                                 batch_chars,

@@ -70,7 +70,10 @@ pub async fn run(config: &Config) -> Result<()> {
     let mut bm25 = Bm25Index::open(&config.bm25.index_path)?;
     let chunker = ChunkerSet::from_config(&config.chunking)?;
     let initial_budget = config.embedding.max_input_chars.unwrap_or(10_000);
-    let mut batcher = AdaptiveBatcher::new(initial_budget);
+    let mut batcher = AdaptiveBatcher::new(
+        initial_budget,
+        Duration::from_secs(config.embedding.timeout_secs),
+    );
     // Rebuild cache from Qdrant — indexer::run dropped its local copy.
     // Cheap (one scroll, ~1 s for our usual corpus size).
     let mut cache: HashMap<PathBuf, String> = vs.scroll_files().await?;

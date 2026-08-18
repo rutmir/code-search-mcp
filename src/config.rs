@@ -101,9 +101,12 @@ pub struct EmbeddingConfig {
     /// presence triggers an advisory log at startup.
     #[serde(default)]
     pub batch_size: Option<usize>,
-    /// Outer HTTP timeout. The adaptive batcher sets a much shorter per-request
-    /// timeout via `tokio::time::timeout` proportional to batch size; this
-    /// value just bounds the reqwest client's hard cap.
+    /// Outer HTTP timeout, and the transport's hard cap. The adaptive
+    /// batcher derives its own per-request timeout from observed throughput
+    /// and keeps it strictly under this value, so a slow batch always fails
+    /// as the batcher's timeout rather than as an indistinguishable
+    /// transport error. Lowering this therefore also lowers the largest
+    /// batch the batcher will ever assemble.
     #[serde(default = "default_embedding_timeout")]
     pub timeout_secs: u64,
     /// Advisory: starting hint for the adaptive batcher's `budget_chars`.
