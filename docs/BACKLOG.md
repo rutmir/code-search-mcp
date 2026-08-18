@@ -188,23 +188,48 @@ parse attempt fails to typecheck. Use `tree-sitter-kotlin-ng`.
 
 ---
 
-## 5. The `lru` advisories need a tantivy upgrade
+## 5. The `lru` advisories — don't do this for its own sake
 
-**Status:** open, and the only outstanding advisory work.
+**Status:** open, and deliberately parked. Read the cost/benefit before
+picking it up.
 
-`cargo audit` reports three warnings: `instant` (unmaintained, transitive
-and harmless) and two unsound findings in `lru` 0.12.5 — RUSTSEC-2026-0002
-and RUSTSEC-2026-0253. Both are held by `tantivy 0.22`, which pins `lru`
-`^0.12` while the fixes landed in 0.18.2.
+`cargo audit` reports three warnings: `instant` (unmaintained, transitive,
+harmless) and two unsound findings in `lru` 0.12.5 — RUSTSEC-2026-0002 and
+RUSTSEC-2026-0253. Both are held by `tantivy 0.22`, which pins `lru` `^0.12`
+while the fixes landed in 0.18.2.
 
-Note this one *does* force a rebuild, unlike the tree-sitter upgrade: a
-tantivy version change means a `bm25::SCHEMA_VERSION` bump, which feeds
-`config_hard`, which auto-clears. Price it at ~3.5 h on a 6702-chunk
-project before starting.
+### Both are unreachable in this codebase
 
-Neither advisory is a vulnerability — they are unsoundness that requires
-`catch_unwind` around a panicking `Drop` to reach. Low urgency; do it when
-a tantivy upgrade is wanted for its own sake.
+`lru` appears in exactly one place in tantivy, the block cache in
+`store/reader.rs`:
+
+```rust
+cache: Option<Mutex<LruCache<usize, Block>>>
+```
+
+The key type is `usize`, and that settles it:
+
+- **RUSTSEC-2026-0253** (use-after-free in `pop()`) requires, per the
+  advisory's own wording, a key type with a *panicking `Drop`* and a
+  `catch_unwind` around it. `usize` has no destructor at all. Not unlikely —
+  impossible.
+- **RUSTSEC-2026-0002** (`IterMut` violates Stacked Borrows) requires calling
+  `iter_mut()` on the cache. The only `iter_mut()` under `store/` is on a
+  `Vec` in `skip_index_builder.rs`. The cache is never iterated.
+
+Both are unsoundness rather than vulnerabilities: undefined behaviour by
+Miri's rules, reachable only through a pattern that isn't present here.
+
+### So the benefit is a clean audit line, and the cost is 3.5 hours
+
+A tantivy upgrade moves `bm25::SCHEMA_VERSION`, which feeds `config_hard`,
+which auto-clears — a full reindex, measured at ~3.5 h on a 6702-chunk
+project. Trading that for one line in a report is a bad deal.
+
+**Do it when tantivy is wanted for its own reasons** — performance, a fix,
+a feature — and take the advisories as a free side effect. If that day comes,
+check what current tantivy releases actually offer first; that was not
+established here.
 
 ---
 
