@@ -11,48 +11,76 @@ argument. See `docs/CHANGELOG.md` for what has already landed.
 
 ---
 
-## 1. Let the batcher derive its limits instead of guessing them
+## 1. ~~Let the batcher derive its limits instead of guessing them~~
 
-**Status:** ready to implement.
-
-Two constants in `adaptive_batcher.rs` claim to know a server they have never
-met. The project's whole premise is that it adapts to hosts of very different
-speeds, and these are the places where it stops doing that.
-
-**`MAX_BUDGET = 256_000`** is a hard ceiling on the char budget. On a
-CPU-bound llama.cpp host it is unreachable, so the AIMD loop climbs to it,
-times out, halves, and climbs again — paying a full timeout per cycle,
-forever. Observed repeatedly during the v0.0.5 rebuild of a 6702-chunk
-project.
-
-The fix is *not* to lower the number: that would break a GPU host, and
-trading one hard-coded guess for another misses the point. `chars_per_sec` is
-already tracked as an EWMA — derive the ceiling from it, as the largest batch
-that still completes in a sane time at the observed throughput.
-
-**`TIMEOUT_CEILING_SECS = 300`** equals the default `embedding.timeout_secs`,
-so a derived timeout that exceeds the cap is silently truncated and the
-request fails looking exactly like a genuine "batch too large". The batcher
-then shrinks its budget when what was actually wrong was its model of how
-long the server takes. It can never learn that, because the two failures are
-indistinguishable at the point of decision.
-
-Reconcile the two: the batcher's own timeout should fire first and be
-attributable, and a timeout that came from the client's own impatience should
-correct the throughput estimate rather than the budget.
-
-**How you'd know it worked:** reindex a project and grep the log for repeated
-`batch too large` at the same batch size. They should be gone, and total wall
-time should drop against the 3.5 hours that run took.
-
-**Risk:** low. A miscalculated ceiling degrades to current behaviour. But it
-can only be judged on a real multi-hour run, so budget for that.
+**Status: done, v0.0.8.** The budget ceiling and the per-request timeout are
+now derived from measured throughput, and a timeout corrects that
+measurement instead of only shrinking the budget. Verified on the reference
+CPU host: the budget converged to ~23 KB against the measured ~750 chars/s
+and stopped, with zero timeouts across a full reindex where the oscillation
+used to produce them routinely. See the v0.0.8 changelog entry.
 
 ---
 
 ## 2. Find out why `docs` is the weakest category
 
-**Status:** investigation, not a task. No known fix yet.
+**Status:** cause identified, one fix tried and measured worse, reverted.
+Still open.
+
+### What the cause turned out to be
+
+Not chunk-size truncation — hypothesis 1 below is dead. Only 4% of markdown
+sections exceed the reranker's 8000-char limit, and the section that a
+failing query should have matched is 6676 chars, comfortably under it.
+
+The real mechanism is BM25's IDF meeting a code corpus. The code-aware
+tokenizer splits `upsert_and_save` into [`upsert`, `and`, `save`], so
+English function words exist as index terms — and in a corpus of source
+code they are *rare*, which BM25 reads as *informative*. A prose question
+therefore scores a match on "and" as though it were a match on a technical
+term.
+
+Measured on a 6702-chunk project: the query "workspace architecture and
+engineering decisions" returned `audit/atr_state.rs` first at bm25=15.37,
+and the one-word query "and" returned that same chunk at exactly the same
+score. The entire ranking of the leader came from the conjunction. The
+document that answered the question was in the pool at rank 11 — so this
+is a ranking defect, not a retrieval one, and widening `dense_k`/`sparse_k`
+will not touch it.
+
+### The fix that didn't work
+
+Dropping a narrow list of English function words from the BM25 query
+(whole words only, so `upsert_and_save` stays intact; query-side only, so
+no reindex). Measured against a baseline on the same index:
+
+| | before | after |
+|---|---|---|
+| MRR | 0.7853 | 0.7777 |
+| recall@10 | 0.9714 | 0.9429 |
+| `symbol` MRR | 0.967 | 1.000 |
+| `semantic` MRR | 0.568 | 0.508 |
+| `docs` MRR | 0.629 | 0.595 |
+
+Worse overall, and the query that motivated the whole investigation moved
+from rank 2 to rank 3. One query fell out of the top ten entirely: "FIFO
+queue fill and VWAP blending of passive and market legs", whose target
+module opens with *"FIFO queue fill (A5-sim), **and** VWAP blending **of**
+passive + market legs"*.
+
+That is the flaw in the idea, and it is worth remembering: a stopword is
+noise when it matches an identifier fragment in unrelated code, and signal
+when it matches prose in the right document. A query-side filter cannot
+tell those apart, so it throws away both.
+
+Anything that works will have to distinguish them — for instance by
+where the term occurs rather than by what the term is. Note also that
+category MRR here moves by ±0.16 between identical runs (five queries per
+category, and the cross-encoder is not deterministic), so only the
+35-query aggregate and the deterministic `symbol` category are worth
+reading closely.
+
+### Where it stands now
 
 `eval/` consistently ranks prose worst: MRR 0.469 with the cross-encoder,
 0.320 without, against 0.967 for exact-symbol lookups. Concretely, "how to
@@ -60,13 +88,13 @@ add support for a new language" returns three chunks of `walker.rs` instead
 of `CONTRIBUTING.md`, which answers it in words. Code out-competes
 documentation on the same vocabulary.
 
-Three hypotheses, cheapest first:
+The hypotheses, and what is left of them:
 
-1. **Heading chunks are too big for the cross-encoder.** The reference config
-   sets `max_chunk_chars = 15000` for markdown while `[reranker]
-   .max_document_chars` defaults to 8000 — so document chunks are truncated
-   on the way in and the reranker judges a fragment. `check` already warns
-   about this mismatch. Lower the markdown chunk cap, re-measure. One run.
+1. ~~**Heading chunks are too big for the cross-encoder.**~~ **Ruled out.**
+   Only 4% of markdown sections exceed the 8000-char limit, the median is
+   679 chars, and the section behind a failing query is 6676 — under the
+   limit and still missing. Costs nothing to re-check on another corpus,
+   but it is not the explanation here.
 2. **BM25 over-rewards identifier density.** Code chunks carry many rare
    tokens; prose carries common ones. Worth looking at the raw `bm25=` scores
    on a `docs` query before doing anything.

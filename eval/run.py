@@ -388,7 +388,10 @@ def main():
     if args.selftest:
         sys.exit(selftest(args.config))
 
-    binary, config = Path(args.binary), Path(args.config)
+    # Resolve before anything else: queries run with the *project* as cwd
+    # (see below), so a relative `--binary` would pass the existence check
+    # here and then fail to spawn from a different directory.
+    binary, config = Path(args.binary).resolve(), Path(args.config)
     if not binary.exists():
         sys.exit(f"binary not found: {binary}  (cargo build --release)")
     if not config.exists():
